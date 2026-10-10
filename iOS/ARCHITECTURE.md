@@ -1205,3 +1205,44 @@ The harness lives outside the repository
       an identity.
   - **Torture coverage:** `TypingTorture` passes seeds 1–6000, with report
     delays capped at 30 frames.
+
+### Typing model v2: immediate execution (contract change, 2026-10-10)
+
+This supersedes the waiting and queuing parts of "Typing correctness is
+paramount" and the round 7 and 8 notes.
+
+**Why.** Every P1 found since round 6 lived in the machinery that made typed
+keys wait for trackpad verification: queues, Return barriers, identity
+waits and deadlines. Each fix added more of it.
+
+**New contract:**
+
+- **Execution:** a key executes immediately when it is released, through
+  the proxy, as on every other iOS keyboard. Keys are never queued, delayed
+  or batched. The proxy serializes edits in the order they are issued.
+- **Trackpad interaction:** a key press ends any trackpad settlement or
+  verification on the spot. No further adjustments are issued for that
+  gesture, and any probe outcome is abandoned.
+- **Accepted residual:** if a key is typed in the same instant a probe is
+  crossing a multi-code-unit cluster, the key may land inside that cluster.
+  It is visible and one delete fixes it. This replaces the old guarantee that
+  typing is never released inside a cluster.
+- **Field binding:** a key goes to the field current at release. If both
+  the press-time and release-time field identities are known and differ, the
+  key is cancelled. A nil identity on either side does not block the key.
+- **Hiding and dictation:** nothing is pending, so hiding loses nothing that
+  was released. Dictation results are claimed only at the moment of
+  immediate insertion.
+- **Shift and double-space:** any host callback that is not a recognized
+  echo of our own edit resets double-space timing and re-derives shift from
+  context. UIKit and WKWebView send no echoes for our edits (measured), so in
+  practice any callback resets them.
+- **Undo:** unchanged and fail-closed.
+- **Trackpad gestures:** the gesture keeps its internal safety machinery
+  (probes, attribution, cluster repair while no key interrupts), but that
+  machinery can never delay or reorder typing.
+
+**Torture-test contract:** the document equals the keys applied in release
+order at the caret positions implied by the script, with an independent
+oracle. Cluster-boundary assertions apply only to gestures that no key
+interrupted.
