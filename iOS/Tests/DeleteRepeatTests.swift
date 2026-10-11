@@ -97,8 +97,7 @@ enum DeleteRepeatTests {
         TestSupport.expectEqual(key.ended(cancelled: false, documentID: fieldB)?.deleteOnce, false)
         _ = key.began(at: 50, documentID: fieldA)
         TestSupport.expectEqual(key.ended(cancelled: true, documentID: fieldA)?.deleteOnce, false)
-        // Released while the field has no identity: it deletes once, bound to its field, and the keyboard
-        // holds it until an identity appears (round 8).
+        // Released while the field has no identity: it deletes once (a missing identity never blocks it).
         _ = key.began(at: 40, documentID: fieldA)
         let unidentified = key.ended(cancelled: false, documentID: nil)
         TestSupport.expectEqual(unidentified?.deleteOnce, true)
@@ -119,10 +118,14 @@ enum DeleteRepeatTests {
         TestSupport.expect(key.press == nil, "press kept in another field")
         // A focus change ends only a press bound to another identified field.
         _ = key.began(at: 80, documentID: fieldB)
-        TestSupport.expectEqual(key.cancel(ifBoundElsewhereThan: fieldB), nil)
-        TestSupport.expectEqual(key.cancel(ifBoundElsewhereThan: nil), nil)
-        TestSupport.expect(key.cancel(ifBoundElsewhereThan: fieldA) != nil, "a press in another field kept")
+        TestSupport.expect(!key.fieldChanged(to: fieldB), "a press in this field ended")
+        TestSupport.expect(!key.fieldChanged(to: nil), "a press ended with no field identified")
+        TestSupport.expect(key.fieldChanged(to: fieldA), "a press in another field kept")
+        TestSupport.expect(key.press == nil, "press kept after it ended")
+        // Pressed before any identity: bound to the first field identified, so the next one ends it.
         _ = key.began(at: 90, documentID: nil)
-        TestSupport.expectEqual(key.cancel(ifBoundElsewhereThan: fieldA), nil)
+        TestSupport.expect(!key.fieldChanged(to: fieldA), "a press with no field ended")
+        TestSupport.expectEqual(key.press?.documentID, fieldA)
+        TestSupport.expect(key.fieldChanged(to: fieldB), "a press bound to A went on in B")
     }
 }

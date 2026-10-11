@@ -10,9 +10,9 @@ import Foundation
 ///   characters, space and return alike. A committed space no longer becomes the trackpad.
 /// - Characters, space and return type on lift (or rollover); shift and layer keys on touch-down;
 ///   delete starts repeating on touch-down.
-/// - Each finger keeps the field the keyboard served when it touched down; what it types carries that
-///   field, so the keyboard can refuse it in another one (ARCHITECTURE.md, "Typing correctness is
-///   paramount").
+/// - Each finger keeps the field the keyboard served when it touched down (or, touched down before any
+///   identity, the first one identified after); what it types carries that field, so the keyboard can
+///   refuse it in another identified one (ARCHITECTURE.md, "Typing model v2").
 struct KeyTouchModel: Equatable, Sendable {
     typealias TouchID = Int
 
@@ -206,21 +206,26 @@ struct KeyTouchModel: Equatable, Sendable {
         return effects
     }
 
-    /// Another field became current (`field`): fingers that touched down in a different identified field
-    /// end without typing; those that touched down in this one, or before any identity (they bind to
-    /// the field identified next), go on (ARCHITECTURE.md, "Typing correctness is paramount").
-    mutating func cancelTouches(boundElsewhereThan field: UUID?) -> [Effect] {
+    /// Another field became current (`field`, ARCHITECTURE.md, "Typing model v2"): fingers that touched
+    /// down before any identity bind to this field; those bound to a different identified field end
+    /// without typing; the rest go on. Nothing changes while no field is identified.
+    mutating func fieldChanged(to field: UUID?) -> [Effect] {
         guard let field else { return [] }
         var effects: [Effect] = []
-        if trackpadTouch != nil, let bound = trackpadField, bound != field {
-            trackpadTouch = nil
-            effects.append(.endTrackpad(cancelled: true))
+        if trackpadTouch != nil {
+            if let bound = trackpadField, bound != field {
+                trackpadTouch = nil
+                effects.append(.endTrackpad(cancelled: true))
+            } else {
+                trackpadField = field
+            }
         }
         var kept: [Touch] = []
-        for touch in touches {
+        for var touch in touches {
             if !touch.committed, let bound = touch.field, bound != field {
                 effects += release(touch)
             } else {
+                if touch.field == nil { touch.field = field }
                 kept.append(touch)
             }
         }

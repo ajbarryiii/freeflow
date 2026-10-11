@@ -110,8 +110,7 @@ struct TypingState: Equatable, Sendable {
     /// Auto-capitalization only moves between off and an automatic one-shot shift; it never
     /// overrides a shift the user set or caps lock. It acts only when what the text calls for changes,
     /// or after the text or the field did (an edit, `resetTiming`): a shift the user just turned off
-    /// stays off while callbacks report the same text (ARCHITECTURE.md, "Typing correctness is
-    /// paramount": a late trackpad report never re-cases the next key).
+    /// stays off while callbacks report the same text (a trackpad report never re-cases the next key).
     mutating func updateAutomaticShift(_ shouldCapitalize: Bool) {
         guard shouldCapitalize != lastAutomaticDecision else { return }
         lastAutomaticDecision = shouldCapitalize
@@ -221,7 +220,19 @@ struct ContextTail: Equatable, Sendable {
     }
 
     mutating func deleted(graphemes count: Int, proxyBefore: String?, at time: TimeInterval) {
-        guard let base = current(proxyBefore: proxyBefore), base.count >= count else {
+        guard let base = current(proxyBefore: proxyBefore) else {
+            forget()
+            return
+        }
+        guard base.count >= count else {
+            // Deleted past the start of an empty model while the proxy still shows the field as it was
+            // before our edits: that reading holds text this keyboard deleted, so it is never the answer.
+            // The caret stays at the start of what is known (at the field's start nothing more was
+            // deleted; before a window's start what precedes is unknown until the proxy shows it).
+            if known?.isEmpty == true, base.isEmpty {
+                hold("", readingBefore: proxyBefore, at: time)
+                return
+            }
             // Deleted past what is known: what precedes is unknown until the proxy says.
             forget()
             return

@@ -204,6 +204,11 @@ enum TypingRulesTests {
         tail.deleted(graphemes: 2, proxyBefore: "Ok", at: 1)
         TestSupport.expectEqual(tail.known, "")
         TestSupport.expectEqual(tail.current(proxyBefore: "Ok"), "")
+        // Deleting past that while the proxy still shows the deleted text keeps the model empty: a reading
+        // known to be behind is never the answer.
+        tail.deleted(graphemes: 1, proxyBefore: "Ok", at: 1)
+        TestSupport.expectEqual(tail.known, "")
+        TestSupport.expectEqual(tail.current(proxyBefore: "Ok"), "")
         tail.forget()
         tail.deleted(graphemes: 1, proxyBefore: "\n", at: 1)
         TestSupport.expectEqual(tail.known, nil)

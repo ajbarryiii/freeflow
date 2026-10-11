@@ -1,35 +1,34 @@
 import Foundation
 
-/// The keyboard's editing side as `KeyboardInput` drives it (ARCHITECTURE.md, "Typing correctness is
-/// paramount"): touches through `KeyTouchModel` (each key bound to the field at its touch-down), keys
-/// through `KeyboardEditor` with the real `TypingState`, the held delete key's timer, the trackpad
-/// through the real `TrackpadController` and `TrackpadSession` once per frame, and every host callback
-/// (the trackpad's reports, focus changes, the host app's own edits) delivered between frames.
+/// The keyboard's editing side as `KeyboardInput` drives it (ARCHITECTURE.md, "Typing model v2:
+/// immediate execution"): touches through `KeyTouchModel` (each key bound to the field it touched down
+/// in, or the first one identified after), keys through `KeyboardEditor` with the real `TypingState`,
+/// the held delete key's timer, the trackpad through the real `TrackpadController` and
+/// `TrackpadSession` once per frame, and every host callback (the trackpad's reports, focus changes,
+/// the host app's own edits) delivered between frames.
 enum KeyboardEditorTests {
     static var tests: [TestCase] {
         [
-            ("keysRunAtOnceWhileSettling", testKeysRunAtOnceWhileSettling),
-            ("shiftNeverOvertakesWaitingLetters", testShiftNeverOvertakesWaitingLetters),
+            ("keyRunsAtOnceAndEndsTheGesture", testKeyRunsAtOnceAndEndsTheGesture),
+            ("lettersDuringAProbeRunAtOnceInOrder", testLettersDuringAProbeRunAtOnceInOrder),
+            ("keysAfterReturnFollowTheFocus", testKeysAfterReturnFollowTheFocus),
+            ("hidingLosesNothingTyped", testHidingLosesNothingTyped),
+            ("dictationIsInsertedAtOnce", testDictationIsInsertedAtOnce),
+            ("outsideCaretTapResetsDoubleSpace", testOutsideCaretTapResetsDoubleSpace),
+            ("newFieldsFirstLetterIsCasedFromItsText", testNewFieldsFirstLetterIsCasedFromItsText),
+            ("heldTouchesBindToTheFirstIdentifiedField", testHeldTouchesBindToTheFirstIdentifiedField),
+            ("keysWithoutAnIdentityRunAtOnce", testKeysWithoutAnIdentityRunAtOnce),
             ("ownTypingReportsNeverDropKeys", testOwnTypingReportsNeverDropKeys),
             ("ownTypingReportsNeverEndTheNextGesture", testOwnTypingReportsNeverEndTheNextGesture),
             ("keyReleasedAfterTheFieldChangedNeverLands", testKeyReleasedAfterTheFieldChangedNeverLands),
             ("keyTouchedDownInTheNewFieldSurvivesItsFirstCallback", testKeyTouchedDownInTheNewFieldSurvivesItsFirstCallback),
-            ("unidentifiedKeysWaitForAnIdentity", testUnidentifiedKeysWaitForAnIdentity),
-            ("returnPauseHoldsOnEveryPath", testReturnPauseHoldsOnEveryPath),
-            ("abortWhileKeysWaitNeverReleasesThemInsideACluster", testAbortWhileKeysWaitNeverReleasesThemInsideACluster),
-            ("abortedEdgeProbeNeverSplitsTheEmoji", testAbortedEdgeProbeNeverSplitsTheEmoji),
-            ("keysWaitForTheWholeClusterRepair", testKeysWaitForTheWholeClusterRepair),
-            ("typingWaitHasOneDeadline", testTypingWaitHasOneDeadline),
-            ("lateReportsOfAFinishedGestureAreOurs", testLateReportsOfAFinishedGestureAreOurs),
-            ("cancelledDeleteRevokesWhatWaits", testCancelledDeleteRevokesWhatWaits),
-            ("dictationWaitsLikeAKey", testDictationWaitsLikeAKey),
-            ("hidingRunsWaitingKeysInTheirField", testHidingRunsWaitingKeysInTheirField),
+            ("abortedJumpIsRepairedToABoundary", testAbortedJumpIsRepairedToABoundary),
             ("shiftFollowsAnEditTheProxyShowsLate", testShiftFollowsAnEditTheProxyShowsLate),
+            ("deletingPastTheFieldStartKeepsItsCasing", testDeletingPastTheFieldStartKeepsItsCasing),
             ("deletingASelectionKeepsTheTextBefore", testDeletingASelectionKeepsTheTextBefore),
             ("keyAtTheLiftIsCasedWhereTheCaretLands", testKeyAtTheLiftIsCasedWhereTheCaretLands),
+            ("keyDuringAProbeIsCasedWhereTheHostHasTheCaret", testKeyDuringAProbeIsCasedWhereTheHostHasTheCaret),
             ("reportOfAMoveAsIssuedIsNotTakenForOurKey", testReportOfAMoveAsIssuedIsNotTakenForOurKey),
-            ("keyWaitsForTheLateReportOfAJumpPastTheEdge", testKeyWaitsForTheLateReportOfAJumpPastTheEdge),
-            ("bothReportsOfAMoveAreTheGesturesOwn", testBothReportsOfAMoveAreTheGesturesOwn),
             ("typingTorture", testTypingTorture),
         ]
     }
@@ -40,49 +39,214 @@ enum KeyboardEditorTests {
         KeyboardHarness(FakeTextHost(text: "Hi \u{1F44D}\u{1F3FD}", unit: unit, callbackFrames: callbackFrames))
     }
 
-    private static func testKeysRunAtOnceWhileSettling() {
-        // A gesture lifted while a move is still out and its reports are owed: a key settles it on the
-        // spot and runs at once, where the move takes the caret.
+    // MARK: Immediate execution
+
+    private static func testKeyRunsAtOnceAndEndsTheGesture() {
+        // A key during settlement edits at once where the caret is now: after the move already issued
+        // (the proxy applies adjustments and edits in order). The gesture ends on the spot: nothing more is
+        // adjusted, however far its target was.
         let harness = KeyboardHarness(FakeTextHost(text: "Alpha beta gamma", unit: .utf16, lagFrames: 3, callbackFrames: 3))
         harness.gesture(dx: -30, events: 1)
         TestSupport.expect(harness.trackpad.isActive, "settled before the key")
         TestSupport.expectEqual(harness.document.host.caret, 16)
+        let adjustments = harness.document.host.adjustmentCount
         harness.press(.character("x"))
         TestSupport.expect(!harness.trackpad.isActive, "the gesture kept settling after a key")
-        TestSupport.expect(harness.editor.pendingKeys.isEmpty, "the key waited")
         TestSupport.expectEqual(harness.document.text, "Alpha beta gaxmma")
         harness.settle()
         TestSupport.expectEqual(harness.document.text, "Alpha beta gaxmma")
+        TestSupport.expectEqual(harness.document.host.adjustmentCount, adjustments)
+        // With the finger still down, too.
+        let dragging = KeyboardHarness(FakeTextHost(text: "Alpha beta gamma", unit: .utf16))
+        dragging.gesture(dx: -30, events: 1, lift: false)
+        dragging.press(.character("y"))
+        TestSupport.expect(!dragging.trackpad.isActive, "the gesture went on after a key")
+        let after = dragging.document.host.adjustmentCount
+        dragging.drag(dx: -50, dy: 0)
+        dragging.settle()
+        TestSupport.expectEqual(dragging.document.host.adjustmentCount, after)
+        TestSupport.expectEqual(dragging.document.text, "Alpha beta gaymma")
     }
 
-    private static func testShiftNeverOvertakesWaitingLetters() {
-        // The round-6 review's P1: "a" queued behind settlement, Shift, "b" queued: the queue resolved its
-        // closures after Shift had changed the state, and typed "Ab". Each key is resolved at its press.
-        let harness = emojiField()
-        harness.gesture(dx: -10, events: 1)
-        TestSupport.expect(harness.trackpad.session?.hasOutstandingProbe == true, "no probe out")
-        harness.press(.character("a"))
-        harness.press(.shift)
-        harness.press(.character("b"))
-        TestSupport.expectEqual(harness.editor.pendingKeys.map(\.text), ["a", "B"])
-        TestSupport.expectEqual(harness.document.text, "Hi \u{1F44D}\u{1F3FD}")
+    private static func testLettersDuringAProbeRunAtOnceInOrder() {
+        // The round-6 review's P1 was Shift overtaking letters queued behind a probe. Nothing is queued:
+        // each key edits as it is typed, cased by the shift of that moment, and the probe's outcome is
+        // abandoned. Where a key typed as a probe crosses a cluster lands is the host's (it may be inside
+        // the cluster: the accepted residual), but every key is there, once, in order, together.
+        for unit in [CursorOffsetUnit.utf16, .grapheme] {
+            let harness = emojiField(unit: unit)
+            harness.gesture(dx: -10, events: 1)
+            TestSupport.expect(harness.trackpad.session?.hasOutstandingProbe == true, "no probe out")
+            harness.press(.character("a"))
+            TestSupport.expect(!harness.trackpad.isActive, "the probe kept the gesture going")
+            harness.press(.shift)
+            harness.press(.character("b"))
+            TestSupport.expect(harness.document.text.contains("aB"), "keys not typed at once: \(harness.document.text)")
+            let adjustments = harness.document.host.adjustmentCount
+            harness.settle()
+            TestSupport.expectEqual(harness.document.host.adjustmentCount, adjustments)
+            TestSupport.expectEqual(harness.document.text.replacingOccurrences(of: "aB", with: ""), "Hi \u{1F44D}\u{1F3FD}")
+        }
+    }
+
+    private static func testKeysAfterReturnFollowTheFocus() {
+        // A Return can move the host to another field over several frames (a search field's submit, a
+        // form's next field). Keys typed after it go where the host sends them, at once, like on every
+        // other keyboard; nothing waits and nothing is lost.
+        for focusDelay in [1, 4, 8] {
+            let harness = KeyboardHarness(FakeTextHost(text: "Field A.", model: .uikit))
+            harness.document.returnMovesFocusTo = (FakeTextHost(text: "Field B.", model: .uikit), UUID())
+            harness.document.returnFocusDelay = focusDelay
+            harness.type("x\nyz")
+            harness.settle()
+            harness.type("w")
+            TestSupport.expectEqual(harness.document.previousHosts.last?.text, "Field A.x\n")
+            TestSupport.expectEqual(harness.document.text, "Field B.yzw")
+        }
+        // Without a focus change, in order where the caret is.
+        let staying = KeyboardHarness(FakeTextHost(text: "Field A.", model: .uikit))
+        staying.type("x\nyz")
+        TestSupport.expectEqual(staying.document.text, "Field A.x\nyz")
+    }
+
+    private static func testHidingLosesNothingTyped() {
+        // The round-8 review's P1: keys behind a Return's pause were dropped on hiding. Every key has
+        // been applied by the time the keyboard hides, during a gesture's settling too.
+        let harness = KeyboardHarness(FakeTextHost(text: "Field A.", model: .uikit))
+        harness.type("a\nb")
+        harness.hide()
+        TestSupport.expectEqual(harness.document.text, "Field A.a\nb")
+        let settling = KeyboardHarness(FakeTextHost(text: "Alpha beta gamma", unit: .utf16, lagFrames: 3, callbackFrames: 3))
+        settling.gesture(dx: -30, events: 1)
+        settling.type("xy\nz")
+        settling.hide()
+        settling.frames(10)
+        TestSupport.expectEqual(settling.document.text, "Alpha beta gaxy\nzmma")
+    }
+
+    private static func testDictationIsInsertedAtOnce() {
+        // The round-8 review's P1: a claimed result could queue behind a Return and be dropped. A result is
+        // claimed only while it can be inserted at once (`isBusy` is only a running gesture), and the
+        // insertion is immediate: after a Return, with no identity, ending a gesture.
+        let harness = KeyboardHarness(FakeTextHost(text: "Notes:", model: .uikit))
+        TestSupport.expect(!harness.editor.isBusy, "busy with nothing running")
+        harness.press(.returnKey)
+        TestSupport.expect(!harness.editor.isBusy, "busy after a Return")
+        harness.editor.insertDictation("invented words", now: harness.time)
+        TestSupport.expectEqual(harness.document.text, "Notes:\ninvented words")
+        harness.document.documentID = nil
+        harness.editor.insertDictation(" more", now: harness.time)
+        TestSupport.expectEqual(harness.document.text, "Notes:\ninvented words more")
+        let gesture = KeyboardHarness(FakeTextHost(text: "Alpha beta gamma", unit: .utf16, lagFrames: 3, callbackFrames: 3))
+        gesture.gesture(dx: -30, events: 1)
+        TestSupport.expect(gesture.editor.isBusy, "a running gesture is not busy")
+        gesture.editor.insertDictation(" said", now: gesture.time)
+        TestSupport.expect(!gesture.trackpad.isActive, "the gesture went on after the insertion")
+        TestSupport.expectEqual(gesture.document.text, "Alpha beta ga saidmma")
+        gesture.hide()
+        TestSupport.expectEqual(gesture.document.text, "Alpha beta ga saidmma")
+    }
+
+    // MARK: Shift and double space
+
+    private static func testOutsideCaretTapResetsDoubleSpace() {
+        // The round-8 review's P1: after a gesture and a space, a tap after another word's space within
+        // a second, then Space, replaced that space with ". ". Any callback that is not an echo of our own
+        // edits starts the space timing over.
+        let harness = KeyboardHarness(FakeTextHost(text: "One two three", unit: .utf16, callbackFrames: 2))
+        harness.gesture(dx: -100, events: 1)
+        harness.press(.space)
+        TestSupport.expectEqual(harness.document.text, "One  two three")
+        harness.document.moveCaret(to: 9)
+        harness.frame()
+        harness.press(.space)
         harness.settle()
-        TestSupport.expectEqual(harness.document.text, "Hi aB\u{1F44D}\u{1F3FD}")
+        TestSupport.expectEqual(harness.document.text, "One  two  three")
+        // Plain typing, then a tap: the same.
+        let typed = KeyboardHarness(FakeTextHost(text: "One two", unit: .utf16))
+        typed.press(.space)
+        typed.document.moveCaret(to: 4, reportedAsTextChange: true)
+        typed.frame()
+        typed.press(.space)
+        TestSupport.expectEqual(typed.document.text, "One  two ")
+        // With no callback between them, two spaces still type ". ".
+        let quick = KeyboardHarness(FakeTextHost(text: "One", unit: .utf16))
+        quick.press(.space)
+        quick.frame()
+        quick.press(.space)
+        TestSupport.expectEqual(quick.document.text, "One. ")
+    }
+
+    private static func testNewFieldsFirstLetterIsCasedFromItsText() {
+        // The round-8 review's P1: the first letter typed in a newly focused field before its first
+        // callback took the old field's casing. The field the proxy serves is adopted first.
+        let toEmpty = KeyboardHarness(FakeTextHost(text: "Field A has wor", model: .uikit), autocapitalization: .sentences)
+        TestSupport.expectEqual(toEmpty.editor.typing.shift, .off)
+        toEmpty.document.switchField(to: FakeTextHost(text: "", model: .uikit), id: UUID())
+        toEmpty.press(.character("x"), field: .some(nil))
+        TestSupport.expectEqual(toEmpty.document.text, "X")
+        let toMidSentence = KeyboardHarness(FakeTextHost(text: "Done. ", model: .uikit), autocapitalization: .sentences)
+        TestSupport.expectEqual(toMidSentence.editor.typing.shift, .once)
+        toMidSentence.document.switchField(to: FakeTextHost(text: "In the mid", model: .uikit), id: UUID())
+        toMidSentence.press(.character("x"), field: .some(nil))
+        TestSupport.expectEqual(toMidSentence.document.text, "In the midx")
+        // Its double-space timing does not carry over either.
+        let spacing = KeyboardHarness(FakeTextHost(text: "One", model: .uikit))
+        spacing.press(.space)
+        spacing.document.switchField(to: FakeTextHost(text: "Two ", model: .uikit), id: UUID())
+        spacing.press(.space, field: .some(nil))
+        TestSupport.expectEqual(spacing.document.text, "Two  ")
+    }
+
+    // MARK: Field binding
+
+    private static func testHeldTouchesBindToTheFirstIdentifiedField() {
+        // The round-8 review's P1: a finger that touched down while no field was identified kept no
+        // binding, and released into B after first becoming identified in A. It binds to the first field
+        // identified, A, so it ends without typing in B (both known, different).
+        let fieldA = UUID()
+        let harness = KeyboardHarness(FakeTextHost(text: "Field A.", model: .uikit), documentID: nil)
+        let delete = harness.touchDown(.delete)
+        let letter = harness.touchDown(.character("q"))
+        harness.document.documentID = fieldA
+        harness.document.report(after: 1)
+        harness.frame()
+        TestSupport.expect(harness.model.touches.contains { $0.id == letter }, "a key held before any identity ended in A")
+        harness.document.switchField(to: FakeTextHost(text: "Field B.", model: .uikit), id: UUID())
+        harness.document.report(after: 1)
+        harness.frame()
+        harness.touchUp(letter)
+        harness.touchUp(delete)
+        harness.settle()
+        TestSupport.expectEqual(harness.document.text, "Field B.")
+        TestSupport.expectEqual(harness.document.previousHosts.last?.text, "Field A.")
+        // Released in A, it types in A.
+        let staying = KeyboardHarness(FakeTextHost(text: "Field A.", model: .uikit), documentID: nil)
+        let touch = staying.touchDown(.character("q"))
+        staying.document.documentID = UUID()
+        staying.document.report(after: 1)
+        staying.frame()
+        staying.touchUp(touch)
+        TestSupport.expectEqual(staying.document.text, "Field A.q")
+    }
+
+    private static func testKeysWithoutAnIdentityRunAtOnce() {
+        // A missing identity never blocks a key: while a field connects (nil → nil), and for a key bound
+        // to A released while nothing is identified, it goes to the field the proxy serves, at once.
+        let unidentified = KeyboardHarness(FakeTextHost(text: "Connecting.", model: .uikit), documentID: nil)
+        unidentified.tap(.character("x"))
+        TestSupport.expectEqual(unidentified.document.text, "Connecting.x")
+        let harness = KeyboardHarness(FakeTextHost(text: "Field A.", model: .uikit))
+        let touch = harness.touchDown(.character("z"))
+        harness.document.documentID = nil
+        harness.touchUp(touch)
+        TestSupport.expectEqual(harness.document.text, "Field A.z")
     }
 
     private static func testOwnTypingReportsNeverDropKeys() {
-        // The round-6 review's P1: a, b, c queued; the host reported a's insertion between frames, the
-        // report was an outside change, and b and c were discarded. Our own edits' reports, delayed or
-        // coalesced, are never outside changes, and keys no longer wait in a queue they could be
-        // discarded from.
+        // The round-6 review's P1: a host that reports our own edits had them taken as outside changes.
+        // Delayed or coalesced, they are echoes: never outside changes.
         for delay in [1, 2, 3] {
-            let waiting = emojiField()
-            waiting.document.editCallbackDelay = delay
-            waiting.gesture(dx: -10, events: 1)
-            waiting.type("abc")
-            waiting.settle()
-            TestSupport.expectEqual(waiting.document.text, "Hi abc\u{1F44D}\u{1F3FD}")
-            TestSupport.expect(!waiting.outcomes.contains(.outside), "an own report taken as outside at \(delay)")
             let typed = KeyboardHarness(FakeTextHost(text: "Notes: ", model: .uikit), editCallbackDelay: delay)
             for character in "abc" {
                 typed.press(.character(String(character)))
@@ -104,9 +268,9 @@ enum KeyboardEditorTests {
         harness.type(" four")
         harness.gesture(dx: 0, events: 2, lift: false)
         TestSupport.expect(harness.trackpad.isActive, "the gesture ended")
-        harness.editor.trackpadMoved(dx: -30, dy: 0, timestamp: harness.time)
-        harness.frames(4)
-        harness.editor.trackpadEnded(at: harness.time, cancelled: false)
+        harness.drag(dx: -30, dy: 0)
+        harness.frames(2)
+        harness.trackpad.end(at: harness.time)
         harness.settle()
         TestSupport.expect(!harness.outcomes.contains(.outside), "an own report ended the gesture")
         TestSupport.expectEqual(harness.document.host.caret, "One two three f".utf16.count)
@@ -114,7 +278,7 @@ enum KeyboardEditorTests {
 
     private static func testKeyReleasedAfterTheFieldChangedNeverLands() {
         // The round-6 review's P1: a letter pressed in field A; the proxy served field B before any
-        // callback said so; the release typed into B. Each key is bound to the field of its press.
+        // callback said so; the release typed into B. Both identities are known and differ: cancelled.
         let harness = KeyboardHarness(FakeTextHost(text: "Field A.", model: .uikit))
         let fieldA = harness.field
         let touch = harness.touchDown(.character("x"))
@@ -166,123 +330,11 @@ enum KeyboardEditorTests {
         TestSupport.expectEqual(second.document.text, "Field B")
     }
 
-    private static func testUnidentifiedKeysWaitForAnIdentity() {
-        // The round-7 review's P1: while a field connects, both the key's field and the proxy's identity
-        // were nil, and nil matched nil. A key is typed only into an identified field: one released
-        // without an identity waits (within its deadline) for one, and runs only if it matches its press.
-        // nil → nil: never typed.
-        let unidentified = KeyboardHarness(FakeTextHost(text: "Connecting.", model: .uikit))
-        unidentified.document.documentID = nil
-        unidentified.tap(.character("x"))
-        unidentified.frames(Int(KeyboardEditor.maximumWait * 120) + 4)
-        TestSupport.expectEqual(unidentified.document.text, "Connecting.")
-        TestSupport.expect(unidentified.editor.pendingKeys.isEmpty, "a key kept past its deadline")
-        // nil → B: typed in B once it is identified.
-        let connecting = KeyboardHarness(FakeTextHost(text: "Field A.", model: .uikit))
-        connecting.document.switchField(to: FakeTextHost(text: "Field B.", model: .uikit), id: nil)
-        connecting.document.report(after: 1)
-        connecting.frame()
-        connecting.tap(.character("x"))
-        connecting.tap(.character("y"))
-        connecting.frames(6)
-        TestSupport.expectEqual(connecting.document.text, "Field B.")
-        connecting.document.documentID = UUID()
-        connecting.document.report(after: 1)
-        connecting.settle()
-        TestSupport.expectEqual(connecting.document.text, "Field B.xy")
-        // Bound to A, released while nothing is identified: typed if A comes back, never into B.
-        for comesBack in [true, false] {
-            let harness = KeyboardHarness(FakeTextHost(text: "Field A.", model: .uikit))
-            let fieldA = harness.field
-            let touch = harness.touchDown(.character("z"))
-            harness.document.documentID = nil
-            harness.touchUp(touch)
-            harness.frames(6)
-            if comesBack {
-                harness.document.documentID = fieldA
-            } else {
-                harness.document.switchField(to: FakeTextHost(text: "Field B.", model: .uikit), id: UUID())
-            }
-            harness.document.report(after: 1)
-            harness.settle()
-            TestSupport.expectEqual(harness.document.text, comesBack ? "Field A.z" : "Field B.")
-        }
-    }
 
-    private static func testReturnPauseHoldsOnEveryPath() {
-        // The round-7 review's P2: keys after a Return waited one frame on one path and none on others
-        // (a new gesture, hiding). The host moves focus over several frames, sending what is typed in the
-        // meantime to the new field. Keys pressed in the old field wait out the pause and never land
-        // there.
-        for focusDelay in [1, 4, 8] {
-            // Waiting on a probe, then run: x and the Return in A; y and z never reach B.
-            let waiting = emojiField()
-            waiting.document.returnMovesFocusTo = (FakeTextHost(text: "Field B.", model: .uikit), UUID())
-            waiting.document.returnFocusDelay = focusDelay
-            waiting.gesture(dx: -10, events: 1)
-            waiting.type("x\nyz")
-            waiting.settle()
-            TestSupport.expectEqual(waiting.document.text, "Field B.")
-            TestSupport.expectEqual(waiting.document.previousHosts.last?.text, "Hi x\n\u{1F44D}\u{1F3FD}")
-            // Typed at once: the key after the Return waits too.
-            let typed = KeyboardHarness(FakeTextHost(text: "Field A.", model: .uikit))
-            typed.document.returnMovesFocusTo = (FakeTextHost(text: "Field B.", model: .uikit), UUID())
-            typed.document.returnFocusDelay = focusDelay
-            typed.tap(.returnKey)
-            typed.tap(.character("y"))
-            typed.settle()
-            TestSupport.expectEqual(typed.document.text, "Field B.")
-            TestSupport.expectEqual(typed.document.previousHosts.last?.text, "Field A.\n")
-            // Hiding during the pause: what is behind it is dropped, not typed into B.
-            let hiding = KeyboardHarness(FakeTextHost(text: "Field A.", model: .uikit))
-            hiding.document.returnMovesFocusTo = (FakeTextHost(text: "Field B.", model: .uikit), UUID())
-            hiding.document.returnFocusDelay = focusDelay
-            hiding.tap(.returnKey)
-            hiding.tap(.character("y"))
-            hiding.editor.hide(now: hiding.time)
-            hiding.frames(focusDelay + 2)
-            TestSupport.expectEqual(hiding.document.text, "Field B.")
-        }
-        // Without a focus change, the keys after the Return land in order once the pause is over.
-        let staying = emojiField()
-        staying.gesture(dx: -10, events: 1)
-        staying.type("x\nyz")
-        staying.settle()
-        TestSupport.expectEqual(staying.document.text, "Hi x\nyz\u{1F44D}\u{1F3FD}")
-        // A gesture begun during the pause starts once the keys have run, with the finger's movement.
-        let deferred = KeyboardHarness(FakeTextHost(text: "One two", unit: .utf16))
-        deferred.tap(.returnKey)
-        deferred.tap(.character("a"))
-        deferred.editor.beginTrackpad(layout: FixedWidthLayout(columns: 1_000), linePitch: 20, layoutWidth: 10_000,
-                                      now: deferred.time)
-        TestSupport.expect(!deferred.trackpad.isActive, "the gesture started ahead of the waiting keys")
-        deferred.editor.trackpadMoved(dx: 0, dy: -20, timestamp: deferred.time)
-        deferred.editor.trackpadEnded(at: deferred.time, cancelled: false)
-        deferred.settle()
-        TestSupport.expectEqual(deferred.document.text, "One two\na")
-        TestSupport.expectEqual(deferred.document.host.caret, 1)
-    }
-
-    private static func testAbortWhileKeysWaitNeverReleasesThemInsideACluster() {
-        // A probe left a UTF-16 caret between "e" and its accent; the gesture ends before its outcome is
-        // read (an outside change, say). The key waits until the caret is on a whole-cluster boundary,
-        // and is never typed inside the cluster.
-        let harness = KeyboardHarness(FakeTextHost(text: "e\u{301}", unit: .utf16, callbackFrames: 5))
-        harness.gesture(dx: -10, events: 1)
-        TestSupport.expect(harness.trackpad.session?.hasOutstandingProbe == true, "no probe out")
-        TestSupport.expectEqual(harness.document.host.caret, 1)
-        harness.press(.character("x"))
-        harness.trackpad.abort()
-        TestSupport.expectEqual(harness.document.text, "e\u{301}")
-        harness.settle()
-        TestSupport.expect(harness.document.text == "e\u{301}x" || harness.document.text == "xe\u{301}",
-                           "typed inside the cluster: \(harness.document.text.debugDescription)")
-    }
-
-    private static func testAbortedEdgeProbeNeverSplitsTheEmoji() {
-        // The round-7 review's P1: a jump past the edge stopped between the halves of 👍's surrogate pair,
-        // x waited, an unrelated change ended the gesture, and one repair step reached 👍|🏽: "👍x🏽". The
-        // repair goes on through the abort until the field shows a whole-cluster boundary.
+    private static func testAbortedJumpIsRepairedToABoundary() {
+        // The round-7 review's P1, now with no key involved: a jump past the edge stopped between the
+        // halves of 👍's surrogate pair and an unrelated change ended the gesture. The gesture's own
+        // safety goes on through the abort until the field shows a whole-cluster boundary.
         let harness = KeyboardHarness(FakeTextHost(text: "ab\u{1F44D}\u{1F3FD}cd\nnext line", caret: 0, unit: .utf16,
                                                    window: 2, callbackFrames: 6))
         let touch = harness.beginGesture()
@@ -293,106 +345,26 @@ enum KeyboardEditorTests {
         }
         TestSupport.expect(split, "the jump never stopped inside the pair")
         harness.touchUp(touch)
-        harness.press(.character("Q"))
-        TestSupport.expect(!harness.document.text.contains("Q"), "typed before the jump was resolved")
-        // An unrelated change ends the gesture (what the editor does on an outside change).
         harness.trackpad.abort()
-        TestSupport.expect(!harness.document.text.contains("Q"), "released before the boundary was verified")
+        TestSupport.expect(harness.trackpad.isActive, "the gesture ended with the caret inside the emoji")
         harness.settle()
-        TestSupport.expect(harness.document.text.contains("\u{1F44D}\u{1F3FD}"), "the emoji was split: \(harness.document.text)")
-        TestSupport.expectEqual(harness.document.text.replacingOccurrences(of: "Q", with: ""), "ab\u{1F44D}\u{1F3FD}cd\nnext line")
-    }
-
-    private static func testKeysWaitForTheWholeClusterRepair() {
-        // Found by the typing torture test: a jump past the edge stopped between the halves of a surrogate
-        // pair; its repair out of the pair reaches only the next scalar, still inside "👍🏽". A key pressed
-        // then waits until the caret is on the cluster's edge.
-        let harness = KeyboardHarness(FakeTextHost(text: "ab\u{1F44D}\u{1F3FD}cd\nnext line", caret: 0, unit: .utf16, window: 2))
-        let touch = harness.beginGesture()
-        var pressed = false
-        for _ in 0 ..< 40 where !pressed {
-            harness.drag(dx: 0, dy: 0.5)
-            let host = harness.document.host
-            if !host.caretIsOnBoundary, !host.caretSplitsSurrogatePair {
-                harness.touchUp(touch)
-                harness.press(.character("Q"))
-                pressed = true
-            }
-        }
-        TestSupport.expect(pressed, "the repair never stopped between the scalars")
-        harness.settle()
-        TestSupport.expect(harness.document.text.contains("\u{1F44D}\u{1F3FD}"), "the emoji was split: \(harness.document.text)")
-        TestSupport.expectEqual(harness.document.text.replacingOccurrences(of: "Q", with: ""), "ab\u{1F44D}\u{1F3FD}cd\nnext line")
-    }
-
-    private static func testTypingWaitHasOneDeadline() {
-        // The round-7 review's P2: an edge probe's wait and then a repair's could add up. One deadline,
-        // from the earliest waiting key: then the trackpad ends with a safe boundary recovery and the
-        // keys run, never inside a cluster.
-        let harness = KeyboardHarness(FakeTextHost(text: "ab\u{1F44D}\u{1F3FD}cd\nnext line", caret: 0, unit: .utf16,
-                                                   window: 2, lagFrames: 0, callbackFrames: nil))
-        let touch = harness.beginGesture()
-        var split = false
+        TestSupport.expect(harness.document.host.caretIsOnBoundary, "left inside the emoji")
+        TestSupport.expectEqual(harness.document.text, "ab\u{1F44D}\u{1F3FD}cd\nnext line")
+        // A key during that watch ends it at once, wherever the caret is.
+        let typing = KeyboardHarness(FakeTextHost(text: "ab\u{1F44D}\u{1F3FD}cd\nnext line", caret: 0, unit: .utf16,
+                                                  window: 2, callbackFrames: 6))
+        let finger = typing.beginGesture()
+        split = false
         for _ in 0 ..< 30 where !split {
-            harness.drag(dx: 0, dy: 1)
-            split = !harness.document.host.caretIsOnBoundary
+            typing.drag(dx: 0, dy: 1)
+            split = typing.document.host.caretSplitsSurrogatePair
         }
-        TestSupport.expect(split, "the jump never stopped inside the emoji")
-        harness.touchUp(touch)
-        let pressedAt = harness.time
-        harness.press(.character("Q"))
-        while !harness.document.text.contains("Q"), harness.time < pressedAt + 2 { harness.frame() }
-        TestSupport.expect(harness.time <= pressedAt + KeyboardEditor.maximumWait + 2.0 / 120,
-                           "the key waited \(harness.time - pressedAt) s")
-        harness.settle()
-        TestSupport.expect(harness.document.text.contains("\u{1F44D}\u{1F3FD}"), "the emoji was split: \(harness.document.text)")
+        typing.touchUp(finger)
+        typing.trackpad.abort()
+        typing.press(.character("Q"))
+        TestSupport.expect(!typing.trackpad.isActive, "the watch went on after a key")
+        TestSupport.expect(typing.document.text.contains("Q"), "the key waited")
     }
-
-    private static func testLateReportsOfAFinishedGestureAreOurs() {
-        // A gesture a key settled at once was still owed its reports; arriving later (even after
-        // `syncTimeout`), they are known as its own, not outside changes that would start the space or
-        // shift timing over.
-        let harness = KeyboardHarness(FakeTextHost(text: "Alpha beta gamma", unit: .utf16, callbackFrames: 45))
-        harness.gesture(dx: -30, events: 1)
-        harness.press(.character("x"))
-        harness.settle()
-        TestSupport.expect(!harness.outcomes.contains(.outside), "a late report taken as outside: \(harness.outcomes)")
-        TestSupport.expectEqual(harness.document.text, "Alpha beta gaxmma")
-    }
-
-    private static func testCancelledDeleteRevokesWhatWaits() {
-        // The fourth review's P1, now for deletions waiting on a probe: a cancelled press revokes them;
-        // what was typed with them still runs.
-        let harness = emojiField()
-        harness.gesture(dx: -10, events: 1)
-        harness.editor.heldDelete(.character, token: 7, field: harness.field, now: harness.time)
-        harness.type("ab")
-        harness.editor.revoke(token: 7)
-        harness.settle()
-        TestSupport.expectEqual(harness.document.text, "Hi ab\u{1F44D}\u{1F3FD}")
-    }
-
-    private static func testDictationWaitsLikeAKey() {
-        let harness = emojiField()
-        harness.gesture(dx: -10, events: 1)
-        harness.press(.character("a"))
-        harness.editor.insertDictation(" invented words", now: harness.time)
-        harness.press(.character("b"))
-        harness.settle()
-        TestSupport.expectEqual(harness.document.text, "Hi a invented wordsb\u{1F44D}\u{1F3FD}")
-    }
-
-    private static func testHidingRunsWaitingKeysInTheirField() {
-        let harness = emojiField()
-        harness.gesture(dx: -10, events: 1)
-        harness.type("ab")
-        harness.editor.hide(now: harness.time)
-        TestSupport.expect(harness.editor.pendingKeys.isEmpty, "keys kept after hiding")
-        TestSupport.expect(harness.document.text.contains("ab"), "keys dropped on hiding: \(harness.document.text)")
-        TestSupport.expectEqual(harness.document.text.replacingOccurrences(of: "ab", with: ""), "Hi \u{1F44D}\u{1F3FD}")
-    }
-
-    // MARK: Torture
 
     private static func testShiftFollowsAnEditTheProxyShowsLate() {
         // The proxy shows the keyboard's own deletion a few frames late, and no host reports it (measured).
@@ -420,6 +392,22 @@ enum KeyboardEditorTests {
         let typed = KeyboardHarness(known, autocapitalization: .sentences)
         typed.press(.delete)
         TestSupport.expectEqual(typed.editor.typing.shift, .once)
+    }
+
+    private static func testDeletingPastTheFieldStartKeepsItsCasing() {
+        // Found by the typing torture (seed 6990): the proxy showed our deletions a frame late; deleting
+        // everything known, then once more at the field's start, fell back to the stale reading, which
+        // still showed the deleted text, so the next letter came out lowercase.
+        var host = FakeTextHost(text: "Ab", model: .whole)
+        host.editContextLagFrames = 3
+        let harness = KeyboardHarness(host, autocapitalization: .sentences)
+        TestSupport.expectEqual(harness.editor.typing.shift, .off)
+        for _ in 0 ..< 3 { harness.tap(.delete) }
+        TestSupport.expectEqual(harness.editor.typing.shift, .once)
+        harness.tap(.character("c"))
+        harness.settle()
+        TestSupport.expectEqual(harness.document.text, "C")
+        TestSupport.expectEqual(harness.editor.typing.shift, .off)
     }
 
     private static func testDeletingASelectionKeepsTheTextBefore() {
@@ -452,6 +440,19 @@ enum KeyboardEditorTests {
         TestSupport.expectEqual(start.document.text, "XAlpha beta")
     }
 
+    private static func testKeyDuringAProbeIsCasedWhereTheHostHasTheCaret() {
+        // A key abandons a probe's outcome: it is cased from the text the proxy shows before the caret,
+        // where the probe already took it, never from the text before the probe's starting point.
+        let harness = KeyboardHarness(FakeTextHost(text: "Hi. \u{1F44D}", unit: .utf16, callbackFrames: 3),
+                                      autocapitalization: .sentences)
+        TestSupport.expectEqual(harness.editor.typing.shift, .off)
+        harness.gesture(dx: -10, events: 1)
+        TestSupport.expect(harness.trackpad.session?.hasOutstandingProbe == true, "no probe out")
+        harness.press(.character("x"))
+        harness.settle()
+        TestSupport.expectEqual(harness.document.text, "Hi. X\u{1F44D}")
+    }
+
     private static func testReportOfAMoveAsIssuedIsNotTakenForOurKey() {
         // WebKit reports each adjustment first as issued, showing the context the last key left. Taken for
         // that key's report, the gesture never learned that the proxy showed a caret from before its move.
@@ -465,55 +466,11 @@ enum KeyboardEditorTests {
         TestSupport.expectEqual(harness.document.host.caret, "Alpha beta x".utf16.count - 3)
     }
 
-    private static func testKeyWaitsForTheLateReportOfAJumpPastTheEdge() {
-        // UIKit answers an adjustment at once, provisionally, with the caret clamped to the text it last
-        // reported; only the report shows where it went. A jump one unit past the end of what the proxy
-        // shows (the sentence) lands inside the emoji there, and its report comes after the session's
-        // timeout. A key pressed meanwhile waits for it (within its deadline) and lands after the emoji.
-        let harness = KeyboardHarness(FakeTextHost(text: "Ab. Cd. \u{1F44D} Ef", caret: 5, unit: .utf16, model: .uikit,
-                                                   callbackFrames: 40, provisionalContext: true))
-        harness.gesture(dy: 20, events: 1)
-        // One jump past the end of the sentence, which lands one unit into the emoji.
-        TestSupport.expectEqual(harness.document.host.adjustmentCount, 1)
-        TestSupport.expectEqual(harness.document.host.caret, 9)
-        harness.press(.character("x"))
-        harness.settle()
-        TestSupport.expectEqual(harness.document.text, "Ab. Cd. \u{1F44D}x Ef")
-        TestSupport.expect(harness.document.host.caretIsOnBoundary, "the caret was left inside the emoji")
-        TestSupport.expect(!harness.outcomes.contains(.outside), "the jump's own report taken as an outside change")
-        // The key a while after the jump, its report later than the session's own settling time: the
-        // key's deadline, not the session's, bounds the wait.
-        let later = KeyboardHarness(FakeTextHost(text: "Ab. Cd. \u{1F44D} Ef", caret: 5, unit: .utf16, model: .uikit,
-                                                 callbackFrames: 66, provisionalContext: true))
-        later.gesture(dy: 20, events: 1)
-        later.frames(24)
-        later.press(.character("x"))
-        later.settle()
-        TestSupport.expectEqual(later.document.text, "Ab. Cd. \u{1F44D}x Ef")
-    }
-
-    private static func testBothReportsOfAMoveAreTheGesturesOwn() {
-        // WebKit reports each adjustment twice. A key at the lift ends the gesture with its move's reports
-        // still to come: both are the gesture's, so neither is an outside change that resets the typing
-        // (two spaces still type ". "), though the proxy showed the key late and its own state with it.
-        var host = FakeTextHost(text: "Alpha beta", unit: .grapheme, lagFrames: 2, callbackFrames: 2)
-        host.reportsAsIssuedFirst = true
-        host.editContextLagFrames = 2
-        let harness = KeyboardHarness(host)
-        harness.gesture(dx: -50, events: 1)
-        harness.press(.space)
-        harness.frames(6)
-        harness.press(.space)
-        harness.settle()
-        TestSupport.expect(!harness.outcomes.contains(.outside), "a report of the gesture taken as an outside change")
-        TestSupport.expectEqual(harness.document.text, "Alpha.  beta")
-    }
-
     /// Seeds 1...60 and earlier failures by default; `TORTURE_SEEDS=first-last` runs others (a stress run
     /// on the Mac). Prints the failing seed and the smallest failing number of steps.
     private static func testTypingTorture() {
-        // Seeds a stress run found failing in round 8, each a bug since fixed.
-        var seeds = Array(UInt64(1) ... 60) + [75, 148, 161, 330, 521, 528, 566, 905, 940, 1001]
+        // Seeds a stress run found failing in round 9, each a bug since fixed.
+        var seeds = Array(UInt64(1) ... 60) + [419, 439, 469, 6990, 11942]
         if let range = ProcessInfo.processInfo.environment["TORTURE_SEEDS"]?.split(separator: "-"), range.count == 2,
            let first = UInt64(range[0]), let last = UInt64(range[1]), first <= last {
             seeds = Array(first ... last)
@@ -533,8 +490,9 @@ enum KeyboardEditorTests {
 }
 
 /// The keyboard as `KeyboardInput` wires it, without UIKit: touches through `KeyTouchModel` (keys bound
-/// to the field at touch-down; a focus change ends only touches bound elsewhere), the held delete key's
-/// timer, the space bar's hold, the trackpad's frames, and host callbacks between frames.
+/// to the field at touch-down, or the first identified after; a focus change ends only touches bound
+/// elsewhere), the held delete key's timer, the space bar's hold, the trackpad's frames, hiding, and
+/// host callbacks between frames.
 final class KeyboardHarness {
     static let frameInterval = 1.0 / 120
     static let metrics = KeyboardMetrics(width: 402, height: KeyboardMetrics.regularHeight)
@@ -546,7 +504,7 @@ final class KeyboardHarness {
     private(set) var time: TimeInterval = 100
     private(set) var outcomes: [EditingCore.CallbackOutcome] = []
     var autocapitalization: AutocapitalizationMode
-    /// A session ended (completed or not), before the keys waiting on it run.
+    /// A session ended (completed or not).
     var onSessionEnd: ((Bool) -> Void)?
     private var deleteKey = HeldDeleteKey()
     private var deleteDue: (token: Int, at: TimeInterval, pressedAt: TimeInterval)?
@@ -569,22 +527,26 @@ final class KeyboardHarness {
         }
         _ = model.keysChanged(KeyboardLayout.keys(for: .letters, metrics: Self.metrics, showsGlobe: false), layer: .letters)
         editor.onStateChanged = { [unowned self] in self.applyLayer() }
+        editor.onFieldChanged = { [unowned self] field in
+            if self.deleteKey.fieldChanged(to: field) { self.deleteDue = nil }
+            self.perform(self.model.fieldChanged(to: field))
+        }
         editor.reset(numeric: false)
     }
 
     var field: UUID? { document.documentID }
 
-    /// Nothing is left to happen: no session, no waiting keys or gesture, no touches or timers, no
-    /// callbacks to come, and the proxy shows the field as it is.
+    /// Nothing is left to happen: no session, no touches or timers, no callbacks to come, and the proxy
+    /// shows the field as it is.
     var isQuiet: Bool {
-        !trackpad.isActive && !editor.isWaiting && document.pendingCallbacks == 0 && !document.host.hasCallbacksToCome
+        !trackpad.isActive && document.pendingCallbacks == 0 && !document.host.hasCallbacksToCome
             && !document.host.isContextStale && model.touches.isEmpty && model.trackpadTouch == nil && deleteDue == nil
     }
 
     // MARK: Frames
 
     /// One display frame: due host events and callbacks reach the editor (as `KeyboardInput` delivers
-    /// them), timers fire, waiting keys get their look, then the trackpad's frame.
+    /// them), timers fire, the editor follows the proxy, then the trackpad's frame.
     func frame() {
         time += Self.frameInterval
         document.host.advanceFrame()
@@ -596,7 +558,7 @@ final class KeyboardHarness {
         }
         if let due = deleteDue, due.at <= time {
             if let fired = deleteKey.fire(token: due.token, documentID: document.documentID) {
-                editor.heldDelete(fired.unit, token: due.token, field: fired.field, now: time)
+                editor.heldDelete(fired.unit, field: fired.field, now: time)
                 deleteDue = (due.token, due.pressedAt + fired.nextAt, due.pressedAt)
             } else {
                 deleteDue = nil
@@ -621,13 +583,6 @@ final class KeyboardHarness {
 
     private func deliver(textChanged: Bool) -> EditingCore.CallbackOutcome {
         let outcome = editor.hostChanged(textChanged: textChanged, now: time)
-        if outcome == .newField {
-            if let token = deleteKey.cancel(ifBoundElsewhereThan: document.documentID) {
-                editor.revoke(token: token)
-                deleteDue = nil
-            }
-            perform(model.cancelTouches(boundElsewhereThan: document.documentID))
-        }
         outcomes.append(outcome)
         return outcome
     }
@@ -673,6 +628,21 @@ final class KeyboardHarness {
         touchUp(touchDown(action))
     }
 
+    /// The keyboard hides, as `KeyboardInput.stop` does: every held key and the delete repeat end without
+    /// acting, then the editor drops its copies of the field.
+    func hide() {
+        deleteKey.cancel()
+        deleteDue = nil
+        holdDue = [:]
+        perform(model.cancelAll())
+        editor.hide(now: time)
+    }
+
+    /// The keyboard appears again (`KeyboardInput.reset`).
+    func show() {
+        editor.reset(numeric: false)
+    }
+
     private func applyLayer() {
         let layer = editor.typing.layer
         guard layer != model.layer else { return }
@@ -689,20 +659,17 @@ final class KeyboardHarness {
                 deleteDue = (press.token, time + press.firstAt, time)
             case .endDelete(let cancelled):
                 deleteDue = nil
-                guard let ended = deleteKey.ended(cancelled: cancelled, documentID: document.documentID) else { break }
-                if cancelled {
-                    editor.revoke(token: ended.token)
-                } else if ended.deleteOnce {
-                    editor.heldDelete(.character, token: ended.token, field: ended.field, now: time)
-                }
+                guard let ended = deleteKey.ended(cancelled: cancelled, documentID: document.documentID),
+                      ended.deleteOnce else { break }
+                editor.heldDelete(.character, field: ended.field, now: time)
             case .startHoldTimer(let id):
                 holdDue[id] = time + model.parameters.holdDuration
             case .cancelHoldTimer(let id):
                 holdDue[id] = nil
             case .beginTrackpad:
-                editor.beginTrackpad(layout: FixedWidthLayout(columns: 1_000), linePitch: 20, layoutWidth: 10_000, now: time)
+                editor.beginTrackpad(layout: FixedWidthLayout(columns: 1_000), linePitch: 20, layoutWidth: 10_000)
             case .endTrackpad(let cancelled):
-                editor.trackpadEnded(at: time, cancelled: cancelled)
+                if cancelled { trackpad.cancel(at: time) } else { trackpad.end(at: time) }
             }
         }
     }
@@ -719,7 +686,7 @@ final class KeyboardHarness {
 
     /// One touch event of the trackpad's finger, then two frames (events at 60 Hz, the gain's reference).
     func drag(dx: Double, dy: Double) {
-        editor.trackpadMoved(dx: dx, dy: dy, timestamp: time)
+        trackpad.move(dx: dx, dy: dy, timestamp: time)
         frames(2)
     }
 

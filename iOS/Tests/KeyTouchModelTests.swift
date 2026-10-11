@@ -18,6 +18,7 @@ enum KeyTouchModelTests {
             ("cancelAllEndsEverything", testCancelAllEndsEverything),
             ("cancelledDeleteIsNotARelease", testCancelledDeleteIsNotARelease),
             ("keysCarryTheFieldOfTheirPress", testKeysCarryTheFieldOfTheirPress),
+            ("fieldChangeBindsOrEndsFingers", testFieldChangeBindsOrEndsFingers),
         ]
     }
 
@@ -246,5 +247,28 @@ extension KeyTouchModelTests {
         _ = model.began(4, x: enter.x, y: enter.y, field: fieldA)
         TestSupport.expectEqual(model.began(5, x: a.x, y: a.y, field: fieldB), [.type(.returnKey, field: fieldA)])
         TestSupport.expectEqual(model.ended(5, x: a.x, y: a.y), [.type(.character("a"), field: fieldB)])
+    }
+
+    fileprivate static func testFieldChangeBindsOrEndsFingers() {
+        // The round-8 review's P1 (ARCHITECTURE.md, "Typing model v2"): a finger that touched down before
+        // any identity kept none, and through nil → A → B released into B. A field change binds such
+        // fingers to it, and ends without typing those bound to another identified field.
+        let fieldA = UUID(), fieldB = UUID()
+        var model = model()
+        let a = center(.character("a")), s = center(.character("s")), delete = center(.delete)
+        _ = model.began(1, x: a.x, y: a.y, field: nil)
+        _ = model.began(2, x: delete.x, y: delete.y, field: nil)
+        TestSupport.expectEqual(model.fieldChanged(to: nil), [])
+        TestSupport.expectEqual(model.fieldChanged(to: fieldA), [])
+        TestSupport.expectEqual(model.touches.map(\.field), [fieldA, fieldA])
+        _ = model.began(3, x: s.x, y: s.y, field: fieldA)
+        TestSupport.expectEqual(model.fieldChanged(to: fieldB), [.endDelete(cancelled: true)])
+        TestSupport.expectEqual(model.touches.map(\.id), [1])
+        TestSupport.expect(model.touches.first?.committed == true, "the rollover-committed key was ended instead")
+        // Bound to A and released in A: typed, carrying A.
+        var staying = Self.model()
+        _ = staying.began(1, x: a.x, y: a.y, field: nil)
+        _ = staying.fieldChanged(to: fieldA)
+        TestSupport.expectEqual(staying.ended(1, x: a.x, y: a.y), [.type(.character("a"), field: fieldA)])
     }
 }

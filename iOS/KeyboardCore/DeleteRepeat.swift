@@ -57,11 +57,10 @@ struct DeleteRepeat: Equatable, Sendable {
 /// and asks this what each one may do.
 /// - Every deletion it schedules belongs to its press (`token`) and carries the press's field. A press
 ///   that began while the field had no identity (connecting) binds to the first identity seen after
-///   it. A deletion in another identified field ends the press, deleting nothing; while the field has
-///   no identity, the keyboard holds the deletion until one appears (ARCHITECTURE.md, "Typing
-///   correctness is paramount").
-/// - A release before the first deletion deletes once, in that field. A cancellation (the system's, the
-///   menu covering the keys, hiding) deletes nothing, and the keyboard revokes what the press queued.
+///   it. A deletion in another identified field ends the press, deleting nothing; a missing identity
+///   never blocks one (ARCHITECTURE.md, "Typing model v2").
+/// - A release before the first deletion deletes once. A cancellation (the system's, the menu covering
+///   the keys, hiding) deletes nothing.
 /// - A focus change to another identified field ends the press.
 struct HeldDeleteKey: Equatable, Sendable {
     struct Press: Equatable, Sendable {
@@ -115,27 +114,31 @@ struct HeldDeleteKey: Equatable, Sendable {
         return (unit, current.documentID, schedule.repeatAt(current.deletions).time)
     }
 
-    /// The touch ended while the keyboard serves `documentID`. Returns the press's token, its field, and
-    /// whether to delete once now: a release before the first deletion, unless another identified field
-    /// is current. A cancellation never deletes.
-    mutating func ended(cancelled: Bool, documentID: UUID?) -> (token: Int, field: UUID?, deleteOnce: Bool)? {
+    /// The touch ended while the keyboard serves `documentID`. Returns the press's field and whether to
+    /// delete once now: a release before the first deletion, unless another identified field is
+    /// current. A cancellation never deletes.
+    mutating func ended(cancelled: Bool, documentID: UUID?) -> (field: UUID?, deleteOnce: Bool)? {
         guard var current = press else { return nil }
         press = nil
         let sameField = current.bind(to: documentID)
-        return (current.token, current.documentID, !cancelled && current.deletions == 0 && sameField)
+        return (current.documentID, !cancelled && current.deletions == 0 && sameField)
     }
 
-    /// The keyboard is hiding: the press ends, deleting nothing. Returns its token.
-    mutating func cancel() -> Int? {
-        defer { press = nil }
-        return press?.token
-    }
-
-    /// Another field became current: a press bound to a different identified field ends, deleting
-    /// nothing (returns its token); one made in this field, or before any identity, goes on.
-    mutating func cancel(ifBoundElsewhereThan field: UUID?) -> Int? {
-        guard let current = press, let bound = current.documentID, let field, bound != field else { return nil }
+    /// The keyboard is hiding: the press ends, deleting nothing.
+    mutating func cancel() {
         press = nil
-        return current.token
+    }
+
+    /// Another field became current (ARCHITECTURE.md, "Typing model v2"): a press made before any
+    /// identity binds to this one; a press bound to a different identified field ends, deleting nothing
+    /// (true). One made in this field goes on.
+    mutating func fieldChanged(to field: UUID?) -> Bool {
+        guard var current = press else { return false }
+        guard current.bind(to: field) else {
+            press = nil
+            return true
+        }
+        press = current
+        return false
     }
 }

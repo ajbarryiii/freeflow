@@ -17,9 +17,9 @@ protocol TrackpadHost: AnyObject {
 /// layout; everything else is here, so it is tested.
 ///
 /// A session ends one of two ways: completed (it settled after the lift, timed out settling, or a key
-/// was pressed and it resolved what it had out) or aborted (a stale field or generation, an outside
-/// change, an ambiguous report, a system cancellation, hiding). `onFinished` says which. Typing never
-/// waits on a session for long (ARCHITECTURE.md, "Typing correctness is paramount"): `settleNow`.
+/// ended it) or aborted (a stale field or generation, an outside change, an ambiguous report, a system
+/// cancellation, hiding). `onFinished` says which. Typing never waits on a session (ARCHITECTURE.md,
+/// "Typing model v2"): a key ends it on the spot (`interrupt`).
 ///
 /// The context snapshot lives only in the session and is dropped when it ends; on cancelling or hiding,
 /// at once. The learned offset unit, and whether the field reports each adjustment twice, are kept for
@@ -34,11 +34,9 @@ final class TrackpadController: AdjustmentOwner {
     private var touchRate = TouchRateEstimator()
     /// The keyboard hid while a cancelled session still watches a jump; see `hide`.
     private var isHiding = false
-    /// Reports the last session in this field was still owed when it ended (a key settled it at once),
-    /// by issue time: the next session expects them first.
+    /// Reports the last session in this field was still owed when it ended (a key ended it at once), by
+    /// issue time: the next session expects them first.
     private var owedReports: (documentID: UUID, times: [TimeInterval])?
-    /// The direction that session last moved in, for a split its late report shows.
-    private var lateRepairDirection = 1
     var parameters = TrackpadParameters.standard
     /// The current edit generation, owned by `EditingCore`.
     var currentGeneration: () -> Int = { 0 }
@@ -46,8 +44,8 @@ final class TrackpadController: AdjustmentOwner {
     var onFinished: ((Bool) -> Void)?
     /// The latest time a frame, a key or a cancellation was seen at.
     private(set) var lastTimestamp: TimeInterval = 0
-    /// During `onFinished` of a completed session only: the text before the caret where it left it
-    /// (`TrackpadSession.landingBefore`).
+    /// During `onFinished` of a session a key ended (`interrupt`) only: the text before the caret where
+    /// its last move lands (`TrackpadSession.landingBefore`), which the proxy may not show yet.
     private(set) var finishedLanding: String?
 
     init(host: TrackpadHost) {
@@ -56,9 +54,6 @@ final class TrackpadController: AdjustmentOwner {
 
     /// A gesture is running or settling.
     var isActive: Bool { session != nil }
-
-    /// A key is waiting for this session to resolve a probe it has out (`settleNow`).
-    var isSettlingForTyping: Bool { session?.isSettlingNow == true }
 
     /// The touch delivery rate measured so far and the step scale it gives, for Diagnostics.
     var measuredTouchRate: (rate: Double, scale: Double)? {
@@ -72,7 +67,8 @@ final class TrackpadController: AdjustmentOwner {
     }
 
     /// Starts a gesture in the field the host serves now, laid out by `layout`. A session still running
-    /// (a watch since hiding, or one a key waits on) ends first. False without a field identity.
+    /// (a watch since hiding, or a guard after an outside change) ends first. False without a field
+    /// identity.
     @discardableResult
     func begin(layout: any LineLayout, linePitch: Double, layoutWidth: Double) -> Bool {
         if session != nil { finish(completed: false) }
@@ -108,42 +104,15 @@ final class TrackpadController: AdjustmentOwner {
         session?.end(at: timestamp)
     }
 
-    /// A key was pressed: the session stops settling and the caret is accepted where it is
-    /// (`TrackpadSession.settleNow`). True when the session is gone and the key may run at once; false
-    /// while a probe it has out must be heard from first (at most `syncTimeout`), after which
-    /// `onFinished` follows from `tick`.
-    func settleNow(at timestamp: TimeInterval) -> Bool {
-        lastTimestamp = max(lastTimestamp, timestamp)
-        guard var session else { return true }
-        guard isValid else {
-            finish(completed: false)
-            return true
-        }
-        session.settleNow(at: timestamp)
-        self.session = session
-        guard session.isReadyForTyping(at: timestamp) else { return false }
-        finish(completed: !session.isCancelled)
-        return true
-    }
-
-    /// The keys have waited as long as they may (`KeyboardEditor.maximumWait`): the session ends now,
-    /// leaving the caret where it can be trusted to be on a boundary once the host has applied what is
-    /// issued here (it applies adjustments and edits in order). A probe still out is rolled back;
-    /// otherwise a caret the field shows inside a cluster goes to the cluster's edge, unless a move or
-    /// repair already on its way will take it to one.
-    func forceRelease(at timestamp: TimeInterval) {
+    /// A key was typed, or dictated text inserted (ARCHITECTURE.md, "Typing model v2"): the session ends
+    /// on the spot. Nothing more is issued; an outstanding probe's outcome is abandoned, and the caret is
+    /// wherever the host has it once what was already issued lands (the proxy applies adjustments and
+    /// edits in order).
+    func interrupt(at timestamp: TimeInterval) {
         lastTimestamp = max(lastTimestamp, timestamp)
         guard let session else { return }
-        if let host, let documentID, host.documentID == documentID {
-            if let rollback = session.probeRollback {
-                host.adjust(by: rollback)
-            } else if !session.isLandingOnABoundary,
-                      let offset = TrackpadSession.repairOffset(before: host.contextBefore, after: host.contextAfter,
-                                                                direction: session.repairDirection) {
-                host.adjust(by: offset)
-            }
-        }
-        finish(completed: false)
+        let completed = isValid && !session.isCancelled
+        finish(completed: completed, landing: completed ? session.landingBefore : nil)
     }
 
     /// The system cancelled the gesture: an outstanding probe is rolled back at once, here, so nothing
@@ -170,25 +139,25 @@ final class TrackpadController: AdjustmentOwner {
             isHiding = true
             return
         }
-        abort()
+        finish(completed: false)
     }
 
     /// The document changed under the gesture (an outside change), or a report could not be attributed:
-    /// the gesture ends without another step toward the target. If keys wait on it, or the caret may be
-    /// inside a cluster (something out may leave it there, or the field shows it there: a report that
-    /// came after its time), it first watches the field until the caret is on a whole-cluster boundary, so
-    /// no key lands inside a cluster (`TrackpadSession.cancelForTyping`); its own limit and the keys'
-    /// deadline (`forceRelease`) bound that.
+    /// the gesture ends without another step toward the target. If the caret may be inside a cluster
+    /// (something out may leave it there, or the field shows it there), the session first watches the
+    /// field until the caret is on a whole-cluster boundary (`TrackpadSession.abortGuarding`); a key
+    /// ends that at once, like any session.
     func abort() {
+        // Already watching the boundary after an outside change: another one changes nothing.
+        guard session?.guardsBoundary != true else { return }
         guard var session, !session.isCancelled, let host, let documentID, host.documentID == documentID,
-              session.isSettlingNow || session.mayLeaveCaretInsideCluster
+              session.mayLeaveCaretInsideCluster
                 || TrackpadSession.repairOffset(before: host.contextBefore, after: host.contextAfter,
                                                 direction: session.repairDirection) != nil else {
             return finish(completed: false)
         }
-        let rollback = session.cancelForTyping(at: lastTimestamp)
+        session.abortGuarding(at: lastTimestamp)
         self.session = session
-        if let rollback, rollback != 0 { host.adjust(by: rollback) }
     }
 
     /// The keyboard appeared anew: whatever was left ends at once, a watch since hiding included.
@@ -197,8 +166,8 @@ final class TrackpadController: AdjustmentOwner {
     }
 
     /// The editing side saw another field, or none (as it does for every callback once hidden): end the
-    /// gesture at once (keys bound to the old field will not run), unless a hidden keyboard is still
-    /// watching a cancelled jump, which checks the field on every frame itself.
+    /// gesture at once, unless a hidden keyboard is still watching a cancelled jump, which checks the
+    /// field on every frame itself.
     func fieldChanged() {
         guard !isHiding else { return }
         finish(completed: false)
@@ -216,13 +185,7 @@ final class TrackpadController: AdjustmentOwner {
             if let unit = session.unit { unitCache = (documentID, unit) }
             if let reportsTwice = session.reportsTwice { reportsCache = (documentID, reportsTwice) }
         }
-        if session.isAmbiguous { return abort() }
-        // A guarding session ends once the caret is on a whole-cluster boundary (or its time is up).
-        if session.guardsTyping {
-            if session.isReadyForTyping(at: timestamp) { finish(completed: false) }
-            return
-        }
-        if session.isSettlingNow, session.isReadyForTyping(at: timestamp) { return finish(completed: !session.isCancelled) }
+        if session.isAmbiguous, !session.isCancelled { return abort() }
         if session.isFinished(at: timestamp) { finish(completed: !session.isCancelled) }
     }
 
@@ -238,45 +201,15 @@ final class TrackpadController: AdjustmentOwner {
         session?.fits(before: before, after: after) ?? false
     }
 
-    /// How long after it was issued a finished session's adjustment may still be reported.
-    static let lateReportLifetime: TimeInterval = 1
-
-    /// A finished session in this field still owes reports that may arrive (within their lifetime).
-    func owesReports(at now: TimeInterval) -> Bool {
-        owedReports?.times.contains { now - $0 <= Self.lateReportLifetime && now >= $0 } == true
-    }
-
-    /// No session runs: a callback in the field a finished session ended in, showing some text, within
-    /// `lateReportLifetime` of an adjustment that session was still owed a report for, is that report.
-    /// If it shows the caret inside a cluster (a jump whose report came after its time), the caret goes
-    /// to the cluster's edge at once, before any later key, and that repair's report is expected too.
-    func absorbLateReport(before: String?, after: String?, now: TimeInterval) -> Bool {
-        guard session == nil, var owed = owedReports, let host, host.documentID == owed.documentID,
-              !(before ?? "").isEmpty || !(after ?? "").isEmpty else { return false }
-        owed.times.removeAll { now - $0 > Self.lateReportLifetime || now < $0 }
-        guard !owed.times.isEmpty else {
-            owedReports = nil
-            return false
-        }
-        owed.times.removeFirst()
-        if let offset = TrackpadSession.repairOffset(before: before, after: after, direction: lateRepairDirection),
-           offset != 0 {
-            host.adjust(by: offset)
-            owed.times.append(now)
-        }
-        owedReports = owed.times.isEmpty ? nil : owed
-        return true
-    }
-
     /// The field and the generation are still the ones the gesture started on. While a hidden keyboard
-    /// finishes watching a cancelled jump, or keys wait for a boundary after an outside change, only the
-    /// field counts: hiding and the outside change advanced the generation.
+    /// finishes watching a cancelled jump, or a session guards the boundary after an outside change,
+    /// only the field counts: hiding and the outside change advanced the generation.
     private var isValid: Bool {
         guard let host, let documentID, host.documentID == documentID else { return false }
-        return isHiding || session?.guardsTyping == true || currentGeneration() == generation
+        return isHiding || session?.guardsBoundary == true || currentGeneration() == generation
     }
 
-    private func finish(completed: Bool) {
+    private func finish(completed: Bool, landing: String? = nil) {
         guard let session else {
             if isHiding { isHiding = false; documentID = nil }
             return
@@ -287,9 +220,8 @@ final class TrackpadController: AdjustmentOwner {
         }
         if let documentID, !session.owedReports.isEmpty {
             owedReports = (documentID, session.owedReports)
-            lateRepairDirection = session.repairDirection
         }
-        finishedLanding = completed ? session.landingBefore : nil
+        finishedLanding = landing
         self.session = nil
         onFinished?(completed)
         finishedLanding = nil

@@ -57,12 +57,13 @@ enum TrackpadSessionTests {
             ("emptiedFieldIsNotACrossing", testEmptiedFieldIsNotACrossing),
             ("singleEmojiFieldIsReachedInEitherUnit", testSingleEmojiFieldIsReachedInEitherUnit),
             ("webKitReportsEachAdjustmentTwice", testWebKitReportsEachAdjustmentTwice),
-            ("settlingForAKeyStopsAtTheCaret", testSettlingForAKeyStopsAtTheCaret),
+            ("keyEndsTheGestureOnTheSpot", testKeyEndsTheGestureOnTheSpot),
             ("unresolvedPreMoveReportIsAmbiguous", testUnresolvedPreMoveReportIsAmbiguous),
+            ("ambiguousSessionGuardingASplitStillEnds", testAmbiguousSessionGuardingASplitStillEnds),
             ("preMoveReportSuspendsMovement", testPreMoveReportSuspendsMovement),
-            ("lateReportShowingASplitIsRepaired", testLateReportShowingASplitIsRepaired),
             ("outsideChangeLeavingASplitIsRepaired", testOutsideChangeLeavingASplitIsRepaired),
             ("guardWaitsForAWholeClusterBoundary", testGuardWaitsForAWholeClusterBoundary),
+            ("guardRepairsOnlyFromALandedContext", testGuardRepairsOnlyFromALandedContext),
             ("contextBehindTheCaretIsNoNewSnapshot", testContextBehindTheCaretIsNoNewSnapshot),
             ("staleExpectationsAreRetired", testStaleExpectationsAreRetired),
             ("cancellingReleasesTheLaidOutText", testCancellingReleasesTheLaidOutText),
@@ -1073,40 +1074,32 @@ final class RetainingLayout: LineLayout {
 }
 
 extension TrackpadSessionTests {
-    fileprivate static func testSettlingForAKeyStopsAtTheCaret() {
-        // ARCHITECTURE.md, "Typing correctness is paramount": a key resolves settling at once. With a move
-        // out, the caret is where it lands; nothing more is issued toward the target.
-        var moving = TrackpadSession(before: "Alpha beta gamma", after: "", unit: .utf16, parameters: .flat,
-                                     layout: FixedWidthLayout(columns: 1_000), linePitch: 20, layoutWidth: 10_000)
-        moving.drag(dx: -30, dy: 0)
-        TestSupport.expectEqual(moving.frame(before: "Alpha beta gamma", after: "", timestamp: 1), -3)
-        moving.drag(dx: -30, dy: 0)
-        moving.settleNow(at: 1.01)
-        TestSupport.expect(moving.isReadyForTyping(at: 1.01), "a move out keeps a key waiting")
-        TestSupport.expectEqual(moving.frame(before: "Alpha beta ga", after: "mma", timestamp: 1.02), nil)
-        TestSupport.expectEqual(moving.frame(before: "Alpha beta ga", after: "mma", timestamp: 1.03), nil)
-        // With a probe out, the key waits for its outcome; a split it leaves is repaired; then nothing more.
-        var host = FakeTextHost(text: "ab\u{1F44D}\u{1F3FD}", unit: .utf16, callbackFrames: 2)
-        var probing = makeSession(host)
-        probing.drag(dx: -30, dy: 0)
-        var time = 1.0
-        runFrame(&probing, host: &host, at: time)
-        TestSupport.expect(probing.hasOutstandingProbe, "no probe out")
-        probing.settleNow(at: time)
-        TestSupport.expect(!probing.isReadyForTyping(at: time), "a probe out did not keep the key waiting")
-        for _ in 0 ..< 10 where !probing.isReadyForTyping(at: time) {
-            time += 1.0 / 120
-            runFrame(&probing, host: &host, at: time)
+    fileprivate static func testKeyEndsTheGestureOnTheSpot() {
+        // ARCHITECTURE.md, "Typing model v2": a key ends the gesture at once. With a move out, the caret
+        // is where it lands; with a probe out, its outcome is abandoned. Nothing more is issued either way.
+        for text in ["Alpha beta gamma", "ab\u{1F44D}\u{1F3FD}"] {
+            let document = FakeDocument(FakeTextHost(text: text, unit: .utf16, lagFrames: 2, callbackFrames: 2))
+            let controller = TrackpadController(host: document)
+            controller.parameters = .flat
+            var finished: Bool?
+            controller.onFinished = { finished = $0 }
+            controller.begin(layout: FixedWidthLayout(columns: 1_000), linePitch: 20, layoutWidth: 10_000)
+            controller.move(dx: -30, dy: 0, timestamp: 1)
+            controller.tick(at: 1)
+            TestSupport.expectEqual(document.host.adjustmentCount, 1)
+            controller.move(dx: -30, dy: 0, timestamp: 1.005)
+            controller.interrupt(at: 1.01)
+            TestSupport.expect(!controller.isActive, "the gesture went on after a key")
+            TestSupport.expectEqual(finished, true)
+            var time = 1.01
+            for _ in 0 ..< 60 {
+                time += 1.0 / 120
+                document.host.advanceFrame()
+                while document.host.takeCallback() != nil {}
+                controller.tick(at: time)
+            }
+            TestSupport.expectEqual(document.host.adjustmentCount, 1)
         }
-        TestSupport.expect(probing.isReadyForTyping(at: time), "never ready")
-        let caret = host.caret
-        for _ in 0 ..< 10 {
-            time += 1.0 / 120
-            runFrame(&probing, host: &host, at: time)
-        }
-        TestSupport.expectEqual(host.caret, caret)
-        TestSupport.expect(host.caretIsOnBoundary, "left inside the emoji")
-        TestSupport.expectEqual(host.caret, 2)
     }
 
     fileprivate static func testUnresolvedPreMoveReportIsAmbiguous() {
@@ -1141,6 +1134,33 @@ extension TrackpadSessionTests {
         TestSupport.expectEqual(document.host.caret, 16)
     }
 
+    fileprivate static func testAmbiguousSessionGuardingASplitStillEnds() {
+        // An ambiguous report while the field shows the caret inside a cluster: the session guards the
+        // boundary, repairs the split, and then ends (it stays ambiguous, which must not keep it alive).
+        let document = FakeDocument(FakeTextHost(text: "Hi \u{1F44D} there", unit: .utf16))
+        let controller = TrackpadController(host: document)
+        controller.parameters = .flat
+        var finished: Bool?
+        controller.onFinished = { finished = $0 }
+        controller.begin(layout: FixedWidthLayout(columns: 1_000), linePitch: 20, layoutWidth: 10_000)
+        controller.move(dx: -30, dy: 0, timestamp: 1)
+        controller.tick(at: 1)
+        TestSupport.expectEqual(document.host.caret, 8)
+        TestSupport.expect(controller.acknowledge(before: "Hi \u{1F44D} there", after: nil), "the report as issued")
+        document.host.moveCaret(to: 4)   // the host leaves the caret inside the emoji
+        controller.tick(at: 1.31)
+        TestSupport.expect(controller.session?.isAmbiguous == true, "not ambiguous")
+        TestSupport.expect(controller.session?.guardsBoundary == true, "ended with the caret inside the emoji")
+        var time = 1.31
+        while controller.isActive, time < 3 {
+            time += 1.0 / 120
+            controller.tick(at: time)
+        }
+        TestSupport.expect(!controller.isActive, "the guard never ended")
+        TestSupport.expectEqual(finished, false)
+        TestSupport.expect(document.host.caretIsOnBoundary, "left inside the emoji")
+    }
+
     fileprivate static func testPreMoveReportSuspendsMovement() {
         // The round-7 review's P1: after a report showing the context a move was issued in (WebKit's first
         // report), the session went on moving from where it believed the caret was. Until that move
@@ -1156,24 +1176,6 @@ extension TrackpadSessionTests {
         TestSupport.expectEqual(session.frame(before: "Alpha beta ga", after: "mma", timestamp: 1.1), nil)
         TestSupport.expect(session.acknowledge(before: "Alpha beta ga", after: "mma"), "the report as landed")
         TestSupport.expectEqual(session.frame(before: "Alpha beta ga", after: "mma", timestamp: 1.12), -2)
-    }
-
-    fileprivate static func testLateReportShowingASplitIsRepaired() {
-        // A report that comes after its session ended can show the caret inside a cluster (a jump whose
-        // report came after its time): the caret goes to the cluster's edge at once, before any later key.
-        let document = FakeDocument(FakeTextHost(text: "Hi \u{1F44D} there", unit: .utf16, callbackFrames: 30))
-        let controller = TrackpadController(host: document)
-        controller.parameters = .flat
-        controller.begin(layout: FixedWidthLayout(columns: 1_000), linePitch: 20, layoutWidth: 10_000)
-        controller.move(dx: -30, dy: 0, timestamp: 1)
-        controller.tick(at: 1)
-        TestSupport.expect(controller.settleNow(at: 1.01), "a key waited on a move")
-        TestSupport.expect(controller.owesReports(at: 1.2), "no report owed")
-        document.host.moveCaret(to: 4)
-        TestSupport.expect(controller.absorbLateReport(before: document.contextBefore, after: document.contextAfter, now: 1.2),
-                           "the late report was not taken")
-        TestSupport.expect(document.host.caretIsOnBoundary, "left inside the emoji")
-        TestSupport.expectEqual(document.host.caret, 5)
     }
 
     fileprivate static func testOutsideChangeLeavingASplitIsRepaired() {
@@ -1198,22 +1200,50 @@ extension TrackpadSessionTests {
     }
 
     fileprivate static func testGuardWaitsForAWholeClusterBoundary() {
-        // After an outside change while keys wait, they run only once the field shows the caret on a
-        // whole-cluster boundary: a split the guard already tried to repair keeps them waiting, up to
-        // its limit, however quiet the host is.
+        // After an outside change, the gesture's watch ends only once the field shows the caret on a
+        // whole-cluster boundary: a split it already tried to repair keeps it watching, up to its limit,
+        // however quiet the host is.
         var session = TrackpadSession(before: "Hi there", after: "", unit: .utf16, parameters: .flat,
                                       layout: FixedWidthLayout(columns: 1_000), linePitch: 20, layoutWidth: 10_000)
-        session.settleNow(at: 1)
-        _ = session.cancelForTyping(at: 1)
+        session.abortGuarding(at: 1)
         let split = (before: String(decoding: Array("Hi ".utf16) + [0xD83D], as: UTF16.self),
                      after: String(decoding: [0xDC4D] + Array(" there".utf16), as: UTF16.self))
         TestSupport.expectEqual(session.frame(before: split.before, after: split.after, timestamp: 1.01), 1)
         TestSupport.expectEqual(session.frame(before: split.before, after: split.after, timestamp: 1.02), nil)
         TestSupport.expectEqual(session.frame(before: split.before, after: split.after, timestamp: 1.4), nil)
-        TestSupport.expect(!session.isReadyForTyping(at: 1.4), "keys released with the caret inside the emoji")
-        TestSupport.expect(session.isReadyForTyping(at: 1.61), "keys held past the guard's limit")
+        TestSupport.expect(!session.isFinished(at: 1.4), "the watch ended with the caret inside the emoji")
+        TestSupport.expect(session.isFinished(at: 1.61), "the watch went on past its limit")
         TestSupport.expectEqual(session.frame(before: "Hi \u{1F44D}", after: " there", timestamp: 1.45), nil)
-        TestSupport.expect(session.isReadyForTyping(at: 1.45), "keys held on a whole-cluster boundary")
+        TestSupport.expect(session.isFinished(at: 1.45), "the watch kept going on a whole-cluster boundary")
+    }
+
+    fileprivate static func testGuardRepairsOnlyFromALandedContext() {
+        // Found by the typing torture (seed 11942): the gesture's own repair (-1) was still in flight when
+        // an outside change ended it; the guard repaired the stale split it saw (+1), the two landed in
+        // turn, the field showed the very context already repaired in, and the guard ran out its time
+        // with the caret inside the emoji. It repairs only once what was issued has landed.
+        var session = TrackpadSession(before: "Hi there", after: "", unit: .utf16, parameters: .flat,
+                                      layout: FixedWidthLayout(columns: 1_000), linePitch: 20, layoutWidth: 10_000)
+        session.drag(dx: -10, dy: 0)
+        TestSupport.expectEqual(session.frame(before: "Hi there", after: "", timestamp: 1), -1)
+        // The field as the outside change left it: the caret inside the emoji, the -1 still to land.
+        var host = FakeTextHost(text: "Hi the\u{1F44D}re", caret: 7, unit: .utf16, lagFrames: 3, callbackFrames: 3)
+        host.adjust(by: -1)
+        session.abortGuarding(at: 1)
+        var time = 1.0
+        while !session.isFinished(at: time), time < 3 {
+            time += 1.0 / 120
+            host.advanceFrame()
+            while let report = host.takeCallback() { _ = session.acknowledge(before: report.before, after: report.after) }
+            let context = host.context
+            if let offset = session.frame(before: context.before, after: context.after, timestamp: time), offset != 0 {
+                host.adjust(by: offset)
+            }
+        }
+        for _ in 0 ..< 10 { host.advanceFrame() }
+        TestSupport.expect(host.caretIsOnBoundary, "left inside the emoji at \(host.caret)")
+        TestSupport.expectEqual(host.caret, 6)
+        TestSupport.expect(time < 1.6, "the guard ran out its time")
     }
 
     fileprivate static func testContextBehindTheCaretIsNoNewSnapshot() {
@@ -1308,7 +1338,8 @@ extension TrackpadSessionTests {
         controller.move(dx: -10, dy: 0, timestamp: 1)
         controller.tick(at: 1)
         TestSupport.expectEqual(document.host.caret, 9)
-        TestSupport.expect(controller.settleNow(at: 1.001), "the move kept a key waiting")
+        controller.interrupt(at: 1.001)
+        TestSupport.expect(!controller.isActive, "the move kept the gesture going after a key")
         // The next gesture, before that report.
         controller.begin(layout: FixedWidthLayout(columns: 1_000), linePitch: 20, layoutWidth: 10_000)
         controller.move(dx: -60, dy: 0, timestamp: 1.01)

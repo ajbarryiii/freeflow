@@ -14,7 +14,7 @@ import Foundation
 ///   boundaries in the current context, so a deletion never takes a neighbouring character the
 ///   insertion merged with ("\r" + "\n", a letter + a combining mark).
 /// - **Attribution.** None here: no callback ever counts as this undo's (ARCHITECTURE.md, "Typing
-///   correctness is paramount"). UIKit sends none for `insertText` or `deleteBackward`, so none is
+///   model v2": Undo is unchanged and fails closed). UIKit sends none for `insertText` or `deleteBackward`, so none is
 ///   owed; any callback that is not a pending trackpad adjustment's ends the undo for good (the owner,
 ///   `EditingCore`, invalidates it), our own edits' reports included. A host that edits without
 ///   callbacks is a residual risk the anchors mitigate.

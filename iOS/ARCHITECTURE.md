@@ -1339,3 +1339,34 @@ Battery, which an app cannot read.
 **Agent access.** An agent on the Mac can copy the log from a paired device
 with `xcrun devicectl device copy from --domain-type appDataContainer`.
 `iOS/POWER-TESTING.md` documents the exact command.
+
+### Keyboard round 9 notes (typing model v2, 2026-10-10)
+
+- **Implemented.** The key queue, the Return barrier, identity waits, the
+  batch deadline and every wait on probes, edge jumps and cluster repairs
+  are deleted (production net −286 lines). Keys run on release, and a key
+  ends the gesture on the spot.
+- **Field binding.** A touch or delete press made before any identity binds
+  to the first field that becomes current. A later, different field ends it.
+- **Late reports are not ours.** A report of a finished gesture is a
+  non-echo callback: it resets shift and double-space timing.
+- **Deleting past an empty model.** If the proxy still shows text this
+  keyboard deleted, the typing tail stays empty rather than falling back to
+  the stale reading (casing at a field's start).
+- **Guard repairs only from a landed context.** The boundary guard repairs
+  only once every adjustment issued so far has been reported or is overdue.
+- **Torture test.** It checks release order and immediate execution. For a
+  gesture a key interrupted, the caret and keys may be inside a cluster (the
+  accepted residual). Letters typed into a free gesture are compared
+  ignoring case, because their casing depends on where an abandoned probe
+  landed. Seeds 1–12000 pass. All 18 mutations are killed.
+- **Residual risks:**
+  - In a field whose proxy context starts mid-text, a letter typed while
+    the proxy lags, right after deleting past what it showed, is
+    capitalized as at a sentence start until the proxy catches up.
+  - After an outside change with a repair in flight, the guard may wait up
+    to 0.3 s before repairing. A key typed then lands where the caret is.
+  - The edge watch after a system cancel or hide still uses the
+    once-per-context repair rule without the in-flight check (same class,
+    not hit by any seed).
+  - Device testing of v2 typing is pending.

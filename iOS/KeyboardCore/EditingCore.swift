@@ -24,18 +24,14 @@ protocol AdjustmentOwner: AnyObject {
     func acknowledgeAsIssued(before: String?, after: String?) -> Bool
     /// `selectionDidChange`: whether it matches an adjustment still owed a callback; consumes nothing.
     func fits(before: String?, after: String?) -> Bool
-    /// No gesture is running: whether a callback is the late report of an adjustment a finished gesture
-    /// was still owed (it confirms nothing). Consumes one.
-    func absorbLateReport(before: String?, after: String?, now: TimeInterval) -> Bool
 }
 
 extension AdjustmentOwner {
-    func absorbLateReport(before: String?, after: String?, now: TimeInterval) -> Bool { false }
     func acknowledgeAsIssued(before: String?, after: String?) -> Bool { false }
 }
 
 /// The editing side's bookkeeping, independent of UIKit (ARCHITECTURE.md, "Undo ownership v2" and
-/// "Typing correctness is paramount"):
+/// "Typing model v2: immediate execution"):
 /// - **Field identity.** A nil `documentIdentifier` never matches anything; a different one ends
 ///   everything that belonged to the old field.
 /// - **Edit generation.** Advances on every edit the current owner did not make: typing, each delete,
@@ -54,8 +50,7 @@ final class EditingCore {
     enum CallbackOutcome: Equatable {
         /// An outcome of a pending trackpad adjustment.
         case own
-        /// The report of one of our own inserts or deletes, or a finished gesture's late report. The undo
-        /// is gone; nothing else changes.
+        /// The report of one of our own inserts or deletes. The undo is gone; nothing else changes.
         case ownEdit
         /// Anything else: the generation advanced, and the undo is gone.
         case outside
@@ -91,6 +86,15 @@ final class EditingCore {
     func hide() {
         documentID = nil
         invalidate()
+    }
+
+    /// The proxy already serves a field other than the one the last callback showed (a key typed before
+    /// the new field's first callback): adopt it now, as that callback would. True if it changed.
+    func adoptCurrentField() -> Bool {
+        guard document.documentID != documentID else { return false }
+        documentID = document.documentID
+        invalidate()
+        return true
     }
 
     /// An edit the current owner did not make: typing, a delete, a caret move by the trackpad.
@@ -133,11 +137,6 @@ final class EditingCore {
         if let adjustments, adjustments.isActive,
            textChanged ? adjustments.acknowledge(before: before, after: after) : adjustments.fits(before: before, after: after) {
             return .own
-        }
-        // A finished gesture's report arriving late: ours, though it confirms nothing, so the undo is gone.
-        if let adjustments, !adjustments.isActive, adjustments.absorbLateReport(before: before, after: after, now: now) {
-            undo.invalidate()
-            return .ownEdit
         }
         // Nothing of ours: the undo is gone, and so is anything bound to the document as it was.
         undo.invalidate()

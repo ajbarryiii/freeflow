@@ -330,10 +330,10 @@ enum EditingCoreTests {
         TestSupport.expect(key.fire(token: press.token, documentID: document.documentID) == nil, "deleted in field B")
         TestSupport.expectEqual(document.text, "Field B text.")
         TestSupport.expect(key.press == nil, "press kept after the field changed")
-        // The keyboard's own response to the focus change, before the timer: the press ends.
+        // The keyboard's own response to a focus change to another field, before the timer: the press ends.
         var other = HeldDeleteKey()
         let second = other.began(at: 200, documentID: document.documentID)
-        TestSupport.expectEqual(other.cancel(), second.token)
-        TestSupport.expect(other.fire(token: second.token, documentID: document.documentID) == nil, "fired after cancel")
+        TestSupport.expect(other.fieldChanged(to: UUID()), "a press kept in another field")
+        TestSupport.expect(other.fire(token: second.token, documentID: document.documentID) == nil, "fired after it ended")
     }
 }

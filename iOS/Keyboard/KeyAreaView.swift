@@ -241,10 +241,10 @@ final class KeyAreaView: UIView {
         refreshPressed()
     }
 
-    /// Another field became current: fingers that touched down in a different identified field end
-    /// without typing; the rest go on.
-    func cancelTouches(boundElsewhereThan field: UUID?) {
-        perform(model.cancelTouches(boundElsewhereThan: field), timestamp: CACurrentMediaTime())
+    /// Another field became current: fingers that touched down before any identity bind to it, those
+    /// bound to a different identified field end without typing, the rest go on.
+    func fieldChanged(to field: UUID?) {
+        perform(model.fieldChanged(to: field), timestamp: CACurrentMediaTime())
         refreshPressed()
     }
 
