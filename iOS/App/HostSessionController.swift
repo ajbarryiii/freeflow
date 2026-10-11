@@ -103,8 +103,8 @@ final class HostSessionController: ObservableObject {
                                    alwaysOn: { [weak core] in core?.alwaysOn ?? false },
                                    hostLocked: { [weak core] in core?.isLocked ?? false })
         #endif
-        // Locked at launch: nothing may be admitted until protectedDataDidBecomeAvailable.
-        if !UIApplication.shared.isProtectedDataAvailable { core.deviceWillLock() }
+        // Always-on, locked at launch: nothing may be admitted until an unlock (the latch is always-on only).
+        if core.alwaysOn, !UIApplication.shared.isProtectedDataAvailable { core.deviceWillLock() }
         core.launch()
         let timer = Timer(timeInterval: HostSessionPolicy.tickInterval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
@@ -261,9 +261,9 @@ final class HostSessionController: ObservableObject {
                 }
             })
         }
-        on(UIApplication.willEnterForegroundNotification) { $0.core?.foregroundChanged() }
+        on(UIApplication.willEnterForegroundNotification) { $0.core?.appWillEnterForeground() }
         // Arriving in the foreground reconciles; that is what admits a request after a URL open.
-        on(UIApplication.didBecomeActiveNotification) { $0.core?.foregroundChanged() }
+        on(UIApplication.didBecomeActiveNotification) { $0.core?.appDidBecomeActive() }
         on(UIApplication.didEnterBackgroundNotification) {
             $0.core?.foregroundChanged()
             if $0.core?.isDictationInProgress != true { $0.bounceVisible = false }

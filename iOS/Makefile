@@ -33,12 +33,15 @@ APP_POWER_LOG_FLAGS = $(if $(filter 1,$(POWER_LOG)),-D LOCALFLOW_POWER_LOG)
 # A power test build writes every product to $(BUILD_DIR)-power, so the two
 # configurations never share objects, binaries or bundles, whatever the make
 # version, flags or timing (ARCHITECTURE.md, "Power log" → Build gate). Every
-# product path below uses OUT_DIR, never BUILD_DIR. Directories are normalized
-# first (abspath drops a trailing /, /. and ..), so no alias of a -power
-# directory can pass as a normal build's: a POWER_LOG=0 build into any directory
-# ending in -power is refused.
+# product path below uses OUT_DIR, never BUILD_DIR. Paths stay relative in the
+# dependency graph (a trailing / is dropped before the suffix). Only the refusal
+# normalizes (abspath drops /. and .. too): a POWER_LOG=0 build into a directory
+# whose normalized path ends in -power is refused. A path with spaces splits into
+# words there, and any word ending in -power refuses (conservative).
 POWER_SUFFIX = $(if $(filter 1,$(POWER_LOG)),-power)
-out_dir = $(abspath $(1))$(POWER_SUFFIX)
+out_dir = $(1:%/=%)$(POWER_SUFFIX)
+# The power variant of a directory whatever POWER_LOG is, for clean.
+out_dir_power = $(1:%/=%)-power
 OUT_DIR = $(call out_dir,$(BUILD_DIR))
 ifeq ($(POWER_LOG),0)
 ifneq ($(filter %-power,$(abspath $(BUILD_DIR))),)
@@ -448,7 +451,7 @@ e2e-sim:
 	SIMCTL_CHILD_LOCALFLOW_SELFTEST_SKIP_ONBOARDING="$(E2E_SKIP_ONBOARDING)" \
 	SIMCTL_CHILD_LOCALFLOW_SELFTEST_SCREEN="$(E2E_SCREEN)" \
 	SIMCTL_CHILD_LOCALFLOW_SELFTEST_START_SESSION="$(E2E_START_SESSION)" \
-		xcrun simctl launch --terminate-running-process --stdout="$(E2E_LOG)" \
+		xcrun simctl launch --terminate-running-process --stdout="$(CURDIR)/$(E2E_LOG)" \
 		"$$udid" "$(BUNDLE_ID)" >/dev/null; \
 	echo "LocalFlow (self-test build, synthetic microphone) is running on $(E2E_SIM_DEVICE) $$udid."; \
 	echo "  Window:        open -a Simulator --args -CurrentDeviceUDID $$udid"; \
@@ -566,4 +569,6 @@ e2e-sim-scenarios:
 	pass url-hint-stale
 
 clean:
-	rm -rf build $(foreach dir,$(BUILD_DIR) $(SMOKE_BUILD_DIR) $(SMOKE_DEVICE_BUILD_DIR) $(E2E_BUILD_DIR),"$(abspath $(dir))" "$(abspath $(dir))-power") "$(HOST_BUILD_DIR)"
+	@# Each directory is quoted as one whole path, spaces included.
+	rm -rf build "$(BUILD_DIR)" "$(call out_dir_power,$(BUILD_DIR))" "$(SMOKE_BUILD_DIR)" "$(call out_dir_power,$(SMOKE_BUILD_DIR))" \
+		"$(SMOKE_DEVICE_BUILD_DIR)" "$(call out_dir_power,$(SMOKE_DEVICE_BUILD_DIR))" "$(E2E_BUILD_DIR)" "$(call out_dir_power,$(E2E_BUILD_DIR))" "$(HOST_BUILD_DIR)"

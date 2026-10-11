@@ -6,9 +6,9 @@ struct HostEnvironment {
     /// The application state is not `.background` (active or inactive): capture may start, and a fresh
     /// record intent may be admitted without a session.
     var isForeground: @MainActor () -> Bool
-    /// `UIApplication.isProtectedDataAvailable`. Read only when the app arrives in front, to lift the lock
-    /// latch if the unlock notification was missed while suspended; never while polling, because during
-    /// the will-become-unavailable window it still reads true.
+    /// `UIApplication.isProtectedDataAvailable`. Read only on the willEnterForeground and didBecomeActive
+    /// events, to lift the always-on lock latch if the unlock notification was missed while suspended;
+    /// never while polling, because during the will-become-unavailable window it still reads true.
     var isProtectedDataAvailable: @MainActor () -> Bool
     /// Begins a UIKit background task. `onExpiration` runs on main when time runs out; the returned
     /// closure ends the task, and the core calls it exactly once.
@@ -51,11 +51,16 @@ final class HostSessionCore {
     /// it with `setAlwaysOn`). While on: no idle expiry, and a lock cancels an in-progress dictation but
     /// keeps the session, the audio session and the engine. Off by default.
     private(set) var alwaysOn = false
-    /// Latched by `deviceWillLock` (ARCHITECTURE.md, "Locked means no dictation"): while set, no intent is
-    /// admitted and no session, capture or dictation starts, even though iOS posts the lock notification
-    /// before files become unreadable. Cleared by `deviceDidUnlock`, or by arriving in front with protected
-    /// data available (a suspended app can miss the unlock notification); never by polling.
+    /// Always-on only (ARCHITECTURE.md, "Locked means no dictation"): latched by `deviceWillLock` while the
+    /// mode is on. While set, no intent is admitted and no session, capture or dictation starts, even though
+    /// iOS posts the lock notification before files become unreadable. Cleared by `deviceDidUnlock`, by the
+    /// `appWillEnterForeground` / `appDidBecomeActive` events with protected data available (a suspended app
+    /// can miss the unlock notification), and by turning the mode off; never by polling or a derived state.
+    /// With the mode off it is never set, so behavior is exactly as before the mode existed.
     private(set) var isLocked = false
+
+    /// Every latch check: always-on and locked.
+    private var lockedAlwaysOn: Bool { alwaysOn && isLocked }
 
     private var sessionGeneration: UInt64 = 0
     /// A session start waiting for the foreground (the permission prompt was answered elsewhere).
@@ -187,8 +192,6 @@ final class HostSessionCore {
         guard isLaunched else { return }
         let now = environment.now()
         if noteForeground(now) {
-            // Arriving in front with protected data available is an unlock, before this activation reconciles.
-            if isLocked, environment.isProtectedDataAvailable() { isLocked = false }
             if let pending = pendingStart { continueSessionStart(pending, now) }
             // A choice made while the app could not apply it takes effect now that it is in front.
             if session == .active, capture.needsReconfiguration { reconfigureCapture(now) }
@@ -198,12 +201,30 @@ final class HostSessionCore {
         flush(now)
     }
 
+    /// `willEnterForegroundNotification`. The application state may still read background here, so the
+    /// event itself (with protected data available) lifts the lock latch, before anything reconciles.
+    func appWillEnterForeground() {
+        unlatchIfProtectedDataAvailable()
+        foregroundChanged()
+    }
+
+    /// `didBecomeActiveNotification`: as `appWillEnterForeground`.
+    func appDidBecomeActive() {
+        unlatchIfProtectedDataAvailable()
+        foregroundChanged()
+    }
+
+    private func unlatchIfProtectedDataAvailable() {
+        if isLocked, environment.isProtectedDataAvailable() { isLocked = false }
+    }
+
     /// Turns the always-on test mode on or off, at once. Turning it off starts idle expiry from now (or from
     /// the end of a dictation in progress), and the next lock ends the session. It never starts a session.
     /// Before `launch` it only records the choice: run recovery must read the previous run's status first.
     func setAlwaysOn(_ on: Bool) {
         guard on != alwaysOn else { return }
         alwaysOn = on
+        if !on { isLocked = false }
         guard isLaunched else { return }
         let now = environment.now()
         if !on, session == .active, !slot.isInProgress { idleSince = now }
@@ -212,7 +233,7 @@ final class HostSessionCore {
     }
 
     func userStartSession() {
-        guard isLaunched, session == .inactive, !isLocked else { return }
+        guard isLaunched, session == .inactive, !lockedAlwaysOn else { return }
         let now = environment.now()
         guard noteForeground(now) else { return }
         startSession(now)
@@ -246,8 +267,10 @@ final class HostSessionCore {
     /// `protectedDataWillBecomeUnavailable`: cancels everything in flight, including a transcription
     /// that outlived its session, and ends the session unless the always-on test mode is on.
     func deviceWillLock() {
-        isLocked = true
-        guard isLaunched else { return }   // locked at launch: latched; run recovery publishes first
+        if alwaysOn {
+            isLocked = true
+            guard isLaunched else { return }   // locked at launch: latched; run recovery publishes first
+        }
         let now = environment.now()
         if let phase = slot.phase, slot.isInProgress,
            let outcome = HostSessionPolicy.sessionEndOutcome(.deviceLocked, phase: phase) {
@@ -339,7 +362,7 @@ final class HostSessionCore {
         case .none:
             break
         case .start(let requestID):
-            if isLocked {
+            if lockedAlwaysOn {
                 // Read while locked: refused for good, so it is never admitted after the unlock either.
                 knownRequestIDs.insert(requestID)
                 if slot.reject(requestID, error: .deviceLocked, now: now) { needsPublish = true }
@@ -618,8 +641,8 @@ final class HostSessionCore {
     private func continueSessionStart(_ generation: UInt64, _ now: Date) {
         guard generation == sessionGeneration, session == .starting else { return }
         // A session never starts in the background (capture and the permission prompt need the front), nor
-        // while locked.
-        guard environment.isForeground(), !isLocked else {
+        // while locked in always-on.
+        guard environment.isForeground(), !lockedAlwaysOn else {
             pendingStart = generation
             return
         }
@@ -637,7 +660,7 @@ final class HostSessionCore {
                 let now = self.environment.now()
                 if !granted {
                     self.endSession(.startFailed(.microphonePermissionDenied), now)
-                } else if self.environment.isForeground(), !self.isLocked {
+                } else if self.environment.isForeground(), !self.lockedAlwaysOn {
                     self.activateCapture(now)
                 } else {
                     self.pendingStart = generation
