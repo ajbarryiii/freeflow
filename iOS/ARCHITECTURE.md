@@ -1277,7 +1277,11 @@ contains no recorder, writes no power file and shows no Power section.
 binaries or bundles. A production build therefore cannot reuse an
 instrumented product, whatever the make version, flags or timing. This
 replaces any configuration-stamp or parse-time invalidation for
-`POWER_LOG` (decided after three review rounds on that mechanism). The pure
+`POWER_LOG` (decided after three review rounds on that mechanism). Output
+paths are compared after normalization (`abspath`), and a `POWER_LOG=0`
+build into any directory ending in `-power` is refused. The general
+configuration stamp's one-run-late behavior under make 3.81 for other
+variables predates the power log and is out of scope. The pure
 core in HostCore is compiled and tested in every `make check`, but nothing
 outside the gate calls it. Device test builds published to the OTA page set
 `POWER_LOG=1`. The keyboard extension is never instrumented.
@@ -1430,6 +1434,12 @@ the power log alone cannot observe this.
   still cancelled at lock exactly as today: intents and results are class A
   and unavailable while locked. The session, the audio session and the
   engine keep running. Buffers are dropped in the tap, as between dictations.
+- **Locked means no dictation.** The lock notification latches a locked
+  state until `protectedDataDidBecomeAvailable`. While locked, no intent is
+  admitted and no pending capture or dictation starts, even if the intent
+  file is still readable: iOS posts the notification before files become
+  inaccessible. An intent that arrives while locked is never admitted later
+  (added after the always-on review).
 - **Unlock:** dictation continues instantly. Nothing about the session
   restarts.
 - **Other end reasons:** unchanged. These are an interruption, an
