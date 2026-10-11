@@ -67,6 +67,10 @@ final class PowerLogFiles {
 
     var totalBytes: Int { existingFiles.reduce(0) { $0 + size(of: $1) } }
 
+    /// The current file exists but was written with another schema (for example schema 1 after an upgrade):
+    /// appending to it would first rotate it over the older file.
+    var currentHasOtherSchema: Bool { size(of: currentURL) > 0 && !startsWithPreamble(currentURL) }
+
     /// Appends rows, all or nothing. A new file starts with the header and schema line. The current file
     /// is rotated first when the rows would take it past `limitBytes`, or when it was written with another
     /// header. On failure it throws `PowerLogAppendFailure` after undoing what it wrote: a new file is

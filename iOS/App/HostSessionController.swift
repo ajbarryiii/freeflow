@@ -100,8 +100,11 @@ final class HostSessionController: ObservableObject {
         #if LOCALFLOW_POWER_LOG
         let transcriber = self.transcriber
         PowerRecorder.shared.start(computeUnits: { transcriber.activeUnits },
-                                   alwaysOn: { [weak core] in core?.alwaysOn ?? false })
+                                   alwaysOn: { [weak core] in core?.alwaysOn ?? false },
+                                   hostLocked: { [weak core] in core?.isLocked ?? false })
         #endif
+        // Locked at launch: nothing may be admitted until protectedDataDidBecomeAvailable.
+        if !UIApplication.shared.isProtectedDataAvailable { core.deviceWillLock() }
         core.launch()
         let timer = Timer(timeInterval: HostSessionPolicy.tickInterval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
@@ -193,6 +196,7 @@ final class HostSessionController: ObservableObject {
         HostEnvironment(
             now: { Date() },
             isForeground: { UIApplication.shared.applicationState != .background },
+            isProtectedDataAvailable: { UIApplication.shared.isProtectedDataAvailable },
             beginBackgroundTask: { onExpiration in
                 let task = BackgroundTask()
                 task.identifier = UIApplication.shared.beginBackgroundTask(withName: "LocalFlow transcription") {
@@ -265,6 +269,7 @@ final class HostSessionController: ObservableObject {
             if $0.core?.isDictationInProgress != true { $0.bounceVisible = false }
         }
         on(UIApplication.protectedDataWillBecomeUnavailableNotification) { $0.core?.deviceWillLock() }
+        on(UIApplication.protectedDataDidBecomeAvailableNotification) { $0.core?.deviceDidUnlock() }
         on(UIApplication.didReceiveMemoryWarningNotification) { $0.core?.memoryWarning() }
     }
 }

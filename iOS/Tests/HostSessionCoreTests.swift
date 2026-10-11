@@ -374,6 +374,7 @@ enum HostSessionCoreTests {
         TestSupport.expectEqual(h.core.current?.phase, .cancelled)
 
         // A recording in a live session is cancelled the same way.
+        h.core.deviceDidUnlock()   // nothing is admitted while locked
         h.core.userStartSession()
         h.record(S)
         h.core.deviceWillLock()
@@ -1134,6 +1135,8 @@ private final class CoreHarness {
     final class Clock {
         var now = Fixture.now
         var isForeground = true
+        /// `UIApplication.isProtectedDataAvailable`: false once files are unreadable after a lock.
+        var protectedDataAvailable = true
     }
 
     @MainActor
@@ -1172,6 +1175,7 @@ private final class CoreHarness {
         let environment = HostEnvironment(
             now: { clock.now },
             isForeground: { clock.isForeground },
+            isProtectedDataAvailable: { clock.protectedDataAvailable },
             beginBackgroundTask: { expiration in
                 background.begun += 1
                 background.expirations.append(expiration)
@@ -1595,6 +1599,7 @@ enum HostSessionAlwaysOnTests {
         h.clock.now += 2 * 3_600
         h.keepCaptureFresh()
         h.core.tick()
+        h.core.deviceDidUnlock()   // protectedDataDidBecomeAvailable
         try! h.store.writePresence(Fixture.presence(seenAt: h.clock.now))
         h.writeIntent(.record, S)
         h.core.reconcile(.intentSignal)
@@ -1618,5 +1623,280 @@ enum HostSessionAlwaysOnTests {
         h.core.userStartSession()
         h.core.deviceWillLock()
         TestSupport.expectEqual(h.core.session, .active)
+    }
+}
+
+/// "Locked means no dictation" (ARCHITECTURE.md, always-on section): `deviceWillLock` latches a locked
+/// state until `deviceDidUnlock`. iOS posts the lock notification before files become inaccessible, so
+/// these tests keep the intent file readable after it: the latch alone must refuse.
+enum HostSessionLockLatchTests {
+    static var tests: [TestCase] {
+        [
+            ("delayedIntentAfterLockIsRefused", isolated(testDelayedIntentAfterLockIsRefused)),
+            ("latchHoldsAcrossPollingAndTicks", isolated(testLatchHoldsAcrossPollingAndTicks)),
+            ("intentsAfterUnlockAreAdmitted", isolated(testIntentsAfterUnlockAreAdmitted)),
+            ("unreadIntentGetsOnlyTheFreshnessCheck", isolated(testUnreadIntentGetsOnlyTheFreshnessCheck)),
+            ("bounceAfterUnlockWithoutTheNotification", isolated(testBounceAfterUnlockWithoutTheNotification)),
+            ("lateUnlockNotificationStillAdmits", isolated(testLateUnlockNotificationStillAdmits)),
+            ("lockWindowTicksAndPollsKeepTheLatch", isolated(testLockWindowTicksAndPollsKeepTheLatch)),
+            ("nothingStartsWhileLocked", isolated(testNothingStartsWhileLocked)),
+            ("offModeLockStillEndsTheSessionAndUnlocks", isolated(testOffModeLockStillEndsTheSessionAndUnlocks)),
+            ("lockBeforeLaunchPublishesNothing", isolated(testLockBeforeLaunchPublishesNothing)),
+        ]
+    }
+
+    private static func isolated(_ body: @escaping @MainActor () -> Void) -> () -> Void {
+        { MainActor.assumeIsolated { body() } }
+    }
+
+    private static let R = Fixture.requestID
+    private static let S = Fixture.otherRequestID
+    private static let T = UUID(uuidString: "00000000-0000-4000-8000-000000000004")!
+
+    /// An always-on session with LocalFlow in the background and the keyboard present elsewhere.
+    @MainActor
+    private static func lockedBackgroundSession(_ h: CoreHarness) {
+        h.core.setAlwaysOn(true)
+        h.core.userStartSession()
+        h.clock.isForeground = false
+        h.core.foregroundChanged()
+        h.core.deviceWillLock()
+        TestSupport.expectEqual(h.core.session, .active)
+        TestSupport.expect(h.core.isLocked, "latched")
+    }
+
+    @MainActor
+    private static func expectNotRecording(_ h: CoreHarness, _ request: UUID, _ what: String) {
+        TestSupport.expect(h.core.current?.phase != .recording && h.core.current?.phase != .starting,
+                           "\(what): a dictation started while locked")
+        TestSupport.expectEqual(h.buffer.recordingRequestID, nil)
+        if h.core.current?.requestID == request {
+            TestSupport.expectEqual(h.core.current?.phase, .failed)
+            TestSupport.expectEqual(h.core.current?.error, .deviceLocked)
+        }
+    }
+
+    /// A fresh record intent read after the lock callback, while the file is still readable, is refused
+    /// with `.deviceLocked` and remembered, so it is never admitted later.
+    @MainActor
+    private static func testDelayedIntentAfterLockIsRefused() {
+        let h = CoreHarness()
+        defer { h.cleanup() }
+        lockedBackgroundSession(h)
+        h.clock.now += 1
+        try! h.store.writePresence(Fixture.presence(seenAt: h.clock.now))
+        h.writeIntent(.record, R)
+        h.core.reconcile(.intentSignal)
+        expectNotRecording(h, R, "intent signal")
+        TestSupport.expectEqual(h.status?.dictation?.requestID, R)
+        TestSupport.expectEqual(h.status?.dictation?.error, .deviceLocked)
+        TestSupport.expect(h.core.knownRequestIDs.contains(R), "refused requests are known")
+        h.core.deviceDidUnlock()
+        h.core.reconcile(.intentSignal)   // still fresh, but refused for good
+        expectNotRecording(h, R, "after unlock")
+        TestSupport.expectEqual(h.capture.startCount, 1)
+    }
+
+    @MainActor
+    private static func testLatchHoldsAcrossPollingAndTicks() {
+        let h = CoreHarness()
+        defer { h.cleanup() }
+        lockedBackgroundSession(h)
+        for step in 0 ..< 30 {
+            h.clock.now += 2
+            h.keepCaptureFresh()
+            try! h.store.writePresence(Fixture.presence(seenAt: h.clock.now))
+            let request = UUID(uuidString: String(format: "00000000-0000-4000-8000-0000000001%02d", step))!
+            h.writeIntent(.record, request)
+            h.core.tick()   // polls the intent every reconcileInterval
+            expectNotRecording(h, request, "tick \(step)")
+            h.core.reconcile(.poll)
+            expectNotRecording(h, request, "poll \(step)")
+        }
+        TestSupport.expectEqual(h.core.session, .active)
+        TestSupport.expectEqual(h.capture.startCount, 1)
+    }
+
+    /// After unlock, a new intent is admitted into the same session at once.
+    @MainActor
+    private static func testIntentsAfterUnlockAreAdmitted() {
+        let h = CoreHarness()
+        defer { h.cleanup() }
+        lockedBackgroundSession(h)
+        let sessionID = h.core.sessionID
+        h.clock.now += 600
+        h.keepCaptureFresh()
+        h.core.tick()
+        h.core.deviceDidUnlock()
+        TestSupport.expect(!h.core.isLocked, "unlatched")
+        h.clock.now += 1
+        try! h.store.writePresence(Fixture.presence(seenAt: h.clock.now))
+        h.writeIntent(.record, S)
+        h.core.reconcile(.intentSignal)
+        h.deliver()
+        TestSupport.expect(TestSupport.waitUntil(timeout: 2) { h.core.current?.phase == .recording }, "not recording")
+        TestSupport.expectEqual(h.core.current?.requestID, S)
+        TestSupport.expectEqual(h.core.sessionID, sessionID)
+        TestSupport.expectEqual(h.capture.startCount, 1)
+    }
+
+    /// An intent the host never read while locked (the file was unreadable, or it was written just before
+    /// the lock) gets only the normal freshness check after the unlock: there is no "issued before unlock"
+    /// rule, because the keyboard writes an intent before the host comes forward.
+    @MainActor
+    private static func testUnreadIntentGetsOnlyTheFreshnessCheck() {
+        for (delay, admitted) in [(5.0, true), (DictationProtocol.pendingRecordTTL + 5, false)] {
+            let h = CoreHarness()
+            defer { h.cleanup() }
+            h.core.setAlwaysOn(true)
+            h.core.userStartSession()
+            h.clock.isForeground = false
+            h.core.foregroundChanged()
+            try! h.store.writePresence(Fixture.presence(seenAt: h.clock.now))
+            h.writeIntent(.record, R)   // never reconciled before the lock
+            h.core.deviceWillLock()
+            h.clock.protectedDataAvailable = false
+            h.clock.now += delay
+            h.clock.protectedDataAvailable = true
+            h.core.deviceDidUnlock()
+            h.clock.now += 1
+            try! h.store.writePresence(Fixture.presence(seenAt: h.clock.now))
+            h.core.reconcile(.intentSignal)
+            h.deliver()
+            let recording = TestSupport.waitUntil(timeout: admitted ? 2 : 0.2) { h.core.current?.phase == .recording }
+            TestSupport.expectEqual(recording, admitted)
+            TestSupport.expectEqual(h.core.current?.requestID == R, admitted)
+        }
+    }
+
+    /// The regression: the session ended at lock, the app was suspended and missed
+    /// protectedDataDidBecomeAvailable. After the unlock the keyboard writes a fresh intent and opens
+    /// LocalFlow (the bounce); arriving in front with protected data available clears the latch before the
+    /// activation reconciles, so the request is admitted.
+    @MainActor
+    private static func testBounceAfterUnlockWithoutTheNotification() {
+        let h = CoreHarness()
+        defer { h.cleanup() }
+        h.core.userStartSession()
+        h.clock.isForeground = false
+        h.core.foregroundChanged()
+        h.core.deviceWillLock()
+        TestSupport.expectEqual(h.core.session, .inactive)
+        h.clock.protectedDataAvailable = false
+        h.clock.now += 3_600   // suspended overnight; no unlock notification ever arrives
+        h.clock.protectedDataAvailable = true
+        h.writeIntent(.record, R)
+        h.clock.now += 1
+        h.clock.isForeground = true
+        h.core.foregroundChanged()   // willEnterForeground / didBecomeActive
+        TestSupport.expect(!h.core.isLocked, "activation with protected data available unlatches")
+        h.deliver()
+        TestSupport.expect(TestSupport.waitUntil(timeout: 2) { h.core.current?.phase == .recording }, "bounce refused")
+        TestSupport.expectEqual(h.core.current?.requestID, R)
+        TestSupport.expectEqual(h.core.session, .active)
+    }
+
+    /// The unlock notification arrives on resume, after the keyboard wrote its intent: still admitted.
+    @MainActor
+    private static func testLateUnlockNotificationStillAdmits() {
+        let h = CoreHarness()
+        defer { h.cleanup() }
+        h.clock.isForeground = false
+        h.core.foregroundChanged()
+        h.core.deviceWillLock()
+        h.clock.protectedDataAvailable = false
+        h.clock.now += 600
+        h.clock.protectedDataAvailable = true
+        h.writeIntent(.record, R)
+        h.clock.now += 1
+        h.core.deviceDidUnlock()   // delivered late, on resume
+        h.clock.isForeground = true
+        h.core.foregroundChanged()
+        h.deliver()
+        TestSupport.expect(TestSupport.waitUntil(timeout: 2) { h.core.current?.phase == .recording }, "refused")
+        TestSupport.expectEqual(h.core.current?.requestID, R)
+    }
+
+    /// During the will-become-unavailable window UIKit still reports protected data as available: ticks,
+    /// polls and intent signals never clear the latch, even with the app in front.
+    @MainActor
+    private static func testLockWindowTicksAndPollsKeepTheLatch() {
+        let h = CoreHarness()
+        defer { h.cleanup() }
+        h.core.setAlwaysOn(true)
+        h.core.userStartSession()
+        h.core.deviceWillLock()
+        TestSupport.expect(h.clock.protectedDataAvailable && h.clock.isForeground, "the window")
+        for step in 0 ..< 10 {
+            h.clock.now += 1
+            h.keepCaptureFresh()
+            let request = UUID(uuidString: String(format: "00000000-0000-4000-8000-0000000002%02d", step))!
+            h.writeIntent(.record, request)
+            h.core.tick()
+            h.core.reconcile(.poll)
+            h.core.reconcile(.intentSignal)
+            TestSupport.expect(h.core.isLocked, "step \(step): the latch was cleared")
+            expectNotRecording(h, request, "step \(step)")
+        }
+    }
+
+    /// While locked even the foreground paths start nothing: no session, no capture, no dictation.
+    @MainActor
+    private static func testNothingStartsWhileLocked() {
+        let h = CoreHarness()
+        defer { h.cleanup() }
+        h.core.deviceWillLock()
+        h.clock.protectedDataAvailable = false   // files unreadable: arriving in front is no unlock
+        h.core.userStartSession()
+        TestSupport.expectEqual(h.core.session, .inactive)
+        h.writeIntent(.record, R)
+        h.core.reconcile(.activation)
+        h.core.foregroundChanged()
+        h.core.tick()
+        TestSupport.expect(h.core.isLocked, "arriving in front while data is unavailable keeps the latch")
+        h.writeIntent(.record, S)
+        h.core.foregroundChanged()
+        h.core.userStartSession()
+        expectNotRecording(h, S, "second arrival while locked")
+        TestSupport.expectEqual(h.core.session, .inactive)
+        TestSupport.expectEqual(h.capture.startCount, 0)
+        expectNotRecording(h, R, "foreground while locked")
+        h.clock.protectedDataAvailable = true
+        h.core.deviceDidUnlock()
+        h.clock.now += 1
+        h.core.userStartSession()
+        TestSupport.expectEqual(h.core.session, .active)
+    }
+
+    /// With the mode off the lock still ends the session as before; the latch adds only the refusal.
+    @MainActor
+    private static func testOffModeLockStillEndsTheSessionAndUnlocks() {
+        let h = CoreHarness()
+        defer { h.cleanup() }
+        h.record(R)
+        h.core.deviceWillLock()
+        TestSupport.expectEqual(h.core.session, .inactive)
+        TestSupport.expectEqual(h.status?.error, .deviceLocked)
+        TestSupport.expectEqual(h.status?.dictation?.error, .deviceLocked)
+        h.core.deviceDidUnlock()
+        h.clock.now += 1
+        h.record(S)
+        TestSupport.expectEqual(h.core.session, .active)
+        TestSupport.expectEqual(h.status?.error, nil)
+    }
+
+    /// Locked at launch: latched, but nothing is published before run recovery.
+    @MainActor
+    private static func testLockBeforeLaunchPublishesNothing() {
+        let h = CoreHarness(launch: false)
+        defer { h.cleanup() }
+        h.core.deviceWillLock()
+        TestSupport.expectEqual(h.store.readStatus(), .absent)
+        TestSupport.expect(h.core.isLocked, "latched")
+        h.core.launch()
+        h.writeIntent(.record, R)
+        h.core.reconcile(.activation)
+        expectNotRecording(h, R, "after launch while locked")
+        TestSupport.expectEqual(h.capture.startCount, 0)
     }
 }

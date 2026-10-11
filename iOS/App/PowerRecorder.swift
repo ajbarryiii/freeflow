@@ -48,6 +48,8 @@ final class PowerRecorder {
     private var hostState = PowerHostState.idle
     private var computeUnits: @MainActor () -> ComputePolicy.Units? = { nil }
     private var alwaysOn: @MainActor () -> Bool = { false }
+    private var hostLocked: @MainActor () -> Bool = { false }
+    private var protectedState = ProtectedDataState()
     private var timer: Timer?
     private var observers: [NSObjectProtocol] = []
     private var isStarted = false
@@ -64,11 +66,13 @@ final class PowerRecorder {
     }
 
     /// Call once at launch, before the host's run recovery publishes its first status.
-    func start(computeUnits: @escaping @MainActor () -> ComputePolicy.Units?, alwaysOn: @escaping @MainActor () -> Bool) {
+    func start(computeUnits: @escaping @MainActor () -> ComputePolicy.Units?, alwaysOn: @escaping @MainActor () -> Bool,
+               hostLocked: @escaping @MainActor () -> Bool) {
         guard !isStarted else { return }
         isStarted = true
         self.computeUnits = computeUnits
         self.alwaysOn = alwaysOn
+        self.hostLocked = hostLocked
         lastFlushUptime = Self.uptime()
         store?.removeExports(in: exportDirectory)   // left by a run that died while sharing
         UIDevice.current.isBatteryMonitoringEnabled = true
@@ -130,10 +134,23 @@ final class PowerRecorder {
 
     // MARK: Private
 
-    /// `protectedData` overrides the reading where the notification knows better: during "will become
-    /// unavailable" iOS still reports protected data as available.
-    private func record(_ trigger: PowerTrigger, protectedData: PowerProtectedData? = nil) {
+    /// `protectedData` is the notification's own value; it also latches (`ProtectedDataState`), because
+    /// during "will become unavailable" UIKit still reports protected data as available.
+    private func record(_ trigger: PowerTrigger, protectedData notified: PowerProtectedData? = nil) {
         guard let store else { return }
+        var protectedData = notified
+        if trigger == .foreground {
+            // Arriving in front with protected data available is an unlock even if the notification was
+            // missed. Stated explicitly: the host's own latch may not be cleared yet (observer order).
+            let available = UIApplication.shared.isProtectedDataAvailable
+            protectedState.activated(protectedDataAvailable: available)
+            protectedData = available ? .available : .unavailable
+        }
+        switch notified {
+        case .unavailable?: protectedState.willBecomeUnavailable()
+        case .available?: protectedState.didBecomeAvailable()
+        case nil: break
+        }
         let now = Self.uptime()
         var sample = sample(trigger, uptime: now)
         if let protectedData { sample.protectedData = protectedData }
@@ -201,7 +218,8 @@ final class PowerRecorder {
             cpuUserSeconds: cpu.user, cpuSystemSeconds: cpu.system, memoryMB: footprint?.currentMB,
             memoryPeakMB: footprint?.peakMB, computeUnits: computeUnits(), build: build, device: self.device,
             alwaysOn: alwaysOn(),
-            protectedData: UIApplication.shared.isProtectedDataAvailable ? .available : .unavailable)
+            protectedData: protectedState.effective(reading: UIApplication.shared.isProtectedDataAvailable,
+                                                    hostLocked: hostLocked()))
     }
 
     private func observeNotifications() {
@@ -220,6 +238,13 @@ final class PowerRecorder {
         on(Notification.Name.NSProcessInfoPowerStateDidChange, .powerMode)
         on(UIApplication.protectedDataWillBecomeUnavailableNotification, .protectedData, protectedData: .unavailable)
         on(UIApplication.protectedDataDidBecomeAvailableNotification, .protectedData, protectedData: .available)
+        // Becoming active without a foreground transition takes no sample, but may lift the latch too.
+        observers.append(center.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil,
+                                            queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.protectedState.activated(protectedDataAvailable: UIApplication.shared.isProtectedDataAvailable)
+            }
+        })
     }
 
     /// Continues while the device sleeps (unlike `systemUptime`), so suspended intervals within one run

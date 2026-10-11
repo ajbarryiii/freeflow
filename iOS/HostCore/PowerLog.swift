@@ -15,6 +15,24 @@ enum PowerTrigger: String, CaseIterable, Sendable {
 /// `UIApplication.isProtectedDataAvailable`; unavailable means locked (a proxy for screen off).
 enum PowerProtectedData: String, CaseIterable, Sendable { case available, unavailable }
 
+/// The protected-data value power samples record. UIKit's property still reads available while
+/// `protectedDataWillBecomeUnavailable` is delivered, and a dictation the lock cancels publishes a state
+/// sample around then, before or after the recorder's own observer runs. So the lock notification latches
+/// `unavailable` until `protectedDataDidBecomeAvailable`, and the host's own lock latch counts too.
+struct ProtectedDataState: Sendable {
+    private var latched = false
+
+    mutating func willBecomeUnavailable() { latched = true }
+    mutating func didBecomeAvailable() { latched = false }
+    /// Arriving in front: with protected data available it is an unlock, as for the host core (a suspended
+    /// app can miss the unlock notification).
+    mutating func activated(protectedDataAvailable: Bool) { if protectedDataAvailable { latched = false } }
+
+    func effective(reading available: Bool, hostLocked: Bool) -> PowerProtectedData {
+        latched || hostLocked || !available ? .unavailable : .available
+    }
+}
+
 /// What the host was doing, derived from its published status.
 enum PowerHostState: String, CaseIterable, Sendable {
     /// No audio session.

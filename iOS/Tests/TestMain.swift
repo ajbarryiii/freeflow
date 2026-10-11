@@ -43,6 +43,8 @@ struct LocalFlowIOSTests {
             ("PowerLogSummary", PowerLogSummaryTests.tests),
             ("PowerLogStore", PowerLogStoreTests.tests),
             ("HostSessionAlwaysOn", HostSessionAlwaysOnTests.tests),
+            ("HostSessionLockLatch", HostSessionLockLatchTests.tests),
+            ("ProtectedDataState", ProtectedDataStateTests.tests),
         ]
         var count = 0
         for (suite, tests) in suites {

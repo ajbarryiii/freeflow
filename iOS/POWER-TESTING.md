@@ -22,7 +22,8 @@ build writes everything to its own directory, `$(BUILD_DIR)-power`, so it
 never shares objects, binaries or bundles with a normal build. For example,
 `BUILD_DIR=build/device POWER_LOG=1` produces `iOS/build/device-power/LocalFlow.app`,
 and `iOS/build/device/LocalFlow.app` stays the normal build. A `BUILD_DIR`
-ending in `-power` is refused with `POWER_LOG=0`.
+ending in `-power` is refused with `POWER_LOG=0`, after normalization, so
+aliases such as `build/device-power/` or `build/device-power/.` are refused too.
 
 ```bash
 make -C iOS all PLATFORM=device POWER_LOG=1 "${SIGN[@]}"     # SIGN as in README.md → Device

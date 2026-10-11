@@ -179,8 +179,18 @@ final class PowerLogStore: @unchecked Sendable {
             }
             let copies = PowerLogFiles(directory: target, fileName: files.currentURL.lastPathComponent,
                                        rotatedFileName: files.rotatedURL.lastPathComponent, limitBytes: .max)
-            try copies.append(buffer)
-            return .exported(Export(directory: target, files: copies.existingFiles))
+            guard !buffer.isEmpty, copies.currentHasOtherSchema else {
+                try copies.append(buffer)
+                return .exported(Export(directory: target, files: copies.existingFiles))
+            }
+            // The current copy has an older schema: appending would rotate it over the older copy. Both
+            // source snapshots stay as they are, and the buffered rows get a file of their own.
+            let current = files.currentURL
+            let unflushedName = current.deletingPathExtension().lastPathComponent + "-unflushed." + current.pathExtension
+            let unflushed = PowerLogFiles(directory: target, fileName: unflushedName,
+                                          rotatedFileName: unflushedName + ".unused", limitBytes: .max)
+            try unflushed.append(buffer)
+            return .exported(Export(directory: target, files: copies.existingFiles + [unflushed.currentURL]))
         } catch {
             try? fileManager.removeItem(at: target)
             return .failed

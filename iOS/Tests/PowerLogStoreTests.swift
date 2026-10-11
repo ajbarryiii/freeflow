@@ -20,6 +20,7 @@ enum PowerLogStoreTests {
             ("exportIncludesRowsThatCouldNotBeFlushed", testExportIncludesRowsThatCouldNotBeFlushed),
             ("partialClearAdvancesAndSaysSo", testPartialClearAdvancesAndSaysSo),
             ("exportIsCompleteWhenTheFlushLosesRows", testExportIsCompleteWhenTheFlushLosesRows),
+            ("exportKeepsBothFilesDuringSchemaMigration", testExportKeepsBothFilesDuringSchemaMigration),
         ]
     }
 
@@ -385,6 +386,37 @@ extension PowerLogStoreTests {
         let exported = export.files.flatMap { PowerLogCSV.parse(String(decoding: fileData($0), as: UTF8.self)) }
         TestSupport.expectEqual(exported, samples(0 ..< 4))
         TestSupport.expectEqual(snapshot(store).droppedSamples, 2)   // the flush after the copy lost them
+    }
+
+    /// After the schema 2 upgrade both files on disk are schema 1 and new rows are buffered. The export keeps
+    /// both source files exactly and puts the buffered rows in a third file, instead of rotating the
+    /// current copy over the older one.
+    fileprivate static func testExportKeepsBothFilesDuringSchemaMigration() {
+        let directory = TestSupport.makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let (store, files) = makeStore(directory)
+        try! FileManager.default.createDirectory(at: files.directory, withIntermediateDirectories: true)
+        func schema1(_ times: Range<Int>) -> String {
+            PowerLogTests.schema1Header + "\n# schema=1\n" + times.map { t in
+                "2027-01-15T08:0\(t):00.000Z,\(1_000 + t * 60).000,periodic,idle,foreground,0.800,unplugged,false,nominal,0.000,0.000,120.5,166.0,,1,\"iPhone16,1\"\n"
+            }.joined()
+        }
+        let older = schema1(0 ..< 2), current = schema1(2 ..< 4)
+        try! older.write(to: files.rotatedURL, atomically: true, encoding: .utf8)
+        try! current.write(to: files.currentURL, atomically: true, encoding: .utf8)
+        let buffered = samples(10 ..< 12)
+        for sample in buffered { store.append(sample) }
+        guard case .exported(let export) = exportOutcome(store, into: directory.appendingPathComponent("Exports")) else {
+            return TestSupport.expect(false, "an export")
+        }
+        TestSupport.expectEqual(export.files.map(\.lastPathComponent), ["log.1.csv", "log.csv", "log-unflushed.csv"])
+        TestSupport.expectEqual(String(decoding: fileData(export.files[0]), as: UTF8.self), older)
+        TestSupport.expectEqual(String(decoding: fileData(export.files[1]), as: UTF8.self), current)
+        let exported = export.files.flatMap { PowerLogCSV.parse(String(decoding: fileData($0), as: UTF8.self)) }
+        TestSupport.expectEqual(exported.count, 6)
+        TestSupport.expectEqual(Array(exported.suffix(2)), buffered)
+        TestSupport.expectEqual(exported.prefix(4).map(\.alwaysOn), [false, false, false, false])
+        TestSupport.expectEqual(exported.prefix(4).map(\.protectedData), [nil, nil, nil, nil])
     }
 }
 

@@ -33,12 +33,16 @@ APP_POWER_LOG_FLAGS = $(if $(filter 1,$(POWER_LOG)),-D LOCALFLOW_POWER_LOG)
 # A power test build writes every product to $(BUILD_DIR)-power, so the two
 # configurations never share objects, binaries or bundles, whatever the make
 # version, flags or timing (ARCHITECTURE.md, "Power log" → Build gate). Every
-# product path below uses OUT_DIR, never BUILD_DIR.
+# product path below uses OUT_DIR, never BUILD_DIR. Directories are normalized
+# first (abspath drops a trailing /, /. and ..), so no alias of a -power
+# directory can pass as a normal build's: a POWER_LOG=0 build into any directory
+# ending in -power is refused.
 POWER_SUFFIX = $(if $(filter 1,$(POWER_LOG)),-power)
-OUT_DIR = $(BUILD_DIR)$(POWER_SUFFIX)
+out_dir = $(abspath $(1))$(POWER_SUFFIX)
+OUT_DIR = $(call out_dir,$(BUILD_DIR))
 ifeq ($(POWER_LOG),0)
-ifneq ($(filter %-power,$(BUILD_DIR)),)
-$(error BUILD_DIR=$(BUILD_DIR) is a power test build's directory; drop -power, or set POWER_LOG=1)
+ifneq ($(filter %-power,$(abspath $(BUILD_DIR))),)
+$(error BUILD_DIR=$(BUILD_DIR) is a power test build's directory ($(abspath $(BUILD_DIR))); drop -power, or set POWER_LOG=1)
 endif
 endif
 
@@ -309,7 +313,7 @@ run-sim: install-sim
 	xcrun simctl launch --terminate-running-process "$$udid" "$(BUNDLE_ID)"
 
 SMOKE_BUILD_DIR ?= build/smoke-simulator
-SMOKE_OUT_DIR = $(SMOKE_BUILD_DIR)$(POWER_SUFFIX)
+SMOKE_OUT_DIR = $(call out_dir,$(SMOKE_BUILD_DIR))
 SMOKE_PHRASE ?= The blue lantern is beside the green notebook.
 SMOKE_COMPUTE ?= cpuAndNeuralEngine
 SMOKE_TIMEOUT ?= 900
@@ -348,7 +352,7 @@ smoke-sim:
 # A name or identifier from `xcrun devicectl list devices`.
 DEVICE ?=
 SMOKE_DEVICE_BUILD_DIR ?= build/smoke-device
-SMOKE_DEVICE_OUT_DIR = $(SMOKE_DEVICE_BUILD_DIR)$(POWER_SUFFIX)
+SMOKE_DEVICE_OUT_DIR = $(call out_dir,$(SMOKE_DEVICE_BUILD_DIR))
 SMOKE_DEVICE_LOG = $(SMOKE_DEVICE_OUT_DIR)/obj/selftest.log
 # 0 reruns the self-test build already on DEVICE without building or reinstalling it,
 # so a second run shows whether Core ML kept its on-device specialization (a warm run).
@@ -402,7 +406,7 @@ endif
 .PHONY: e2e-sim e2e-sim-probe e2e-sim-scenarios
 
 E2E_BUILD_DIR ?= build/e2e-simulator
-E2E_OUT_DIR = $(E2E_BUILD_DIR)$(POWER_SUFFIX)
+E2E_OUT_DIR = $(call out_dir,$(E2E_BUILD_DIR))
 E2E_SIM_DEVICE ?= LocalFlow-E2E
 E2E_PHRASE ?= $(SMOKE_PHRASE)
 E2E_AUDIO = tmp/localflow-synthetic-mic.wav
@@ -444,7 +448,7 @@ e2e-sim:
 	SIMCTL_CHILD_LOCALFLOW_SELFTEST_SKIP_ONBOARDING="$(E2E_SKIP_ONBOARDING)" \
 	SIMCTL_CHILD_LOCALFLOW_SELFTEST_SCREEN="$(E2E_SCREEN)" \
 	SIMCTL_CHILD_LOCALFLOW_SELFTEST_START_SESSION="$(E2E_START_SESSION)" \
-		xcrun simctl launch --terminate-running-process --stdout="$(CURDIR)/$(E2E_LOG)" \
+		xcrun simctl launch --terminate-running-process --stdout="$(E2E_LOG)" \
 		"$$udid" "$(BUNDLE_ID)" >/dev/null; \
 	echo "LocalFlow (self-test build, synthetic microphone) is running on $(E2E_SIM_DEVICE) $$udid."; \
 	echo "  Window:        open -a Simulator --args -CurrentDeviceUDID $$udid"; \
@@ -562,5 +566,4 @@ e2e-sim-scenarios:
 	pass url-hint-stale
 
 clean:
-	rm -rf build "$(BUILD_DIR)" "$(BUILD_DIR)-power" "$(SMOKE_BUILD_DIR)" "$(SMOKE_BUILD_DIR)-power" \
-		"$(SMOKE_DEVICE_BUILD_DIR)" "$(SMOKE_DEVICE_BUILD_DIR)-power" "$(E2E_BUILD_DIR)" "$(E2E_BUILD_DIR)-power" "$(HOST_BUILD_DIR)"
+	rm -rf build $(foreach dir,$(BUILD_DIR) $(SMOKE_BUILD_DIR) $(SMOKE_DEVICE_BUILD_DIR) $(E2E_BUILD_DIR),"$(abspath $(dir))" "$(abspath $(dir))-power") "$(HOST_BUILD_DIR)"
