@@ -81,12 +81,20 @@ final class HostSessionController: ObservableObject {
         #endif
         transcriber.onStateChange = { [weak core] in core?.modelStateChanged() }
         core.onChange = { [weak self] in self?.refresh() }
+        #if LOCALFLOW_POWER_LOG
+        // Test builds only: a passive observer of every published status (ARCHITECTURE.md, "Power log").
+        core.onPublish = { PowerRecorder.shared.hostStatusPublished($0) }
+        #endif
     }
 
     /// Call once UIKit has finished launching: run recovery, the launch reconciliation, then the timer
     /// and observers.
     func launch() {
         guard let core, !core.isLaunched else { return }
+        #if LOCALFLOW_POWER_LOG
+        let transcriber = self.transcriber
+        PowerRecorder.shared.start { transcriber.activeUnits }
+        #endif
         core.launch()
         let timer = Timer(timeInterval: HostSessionPolicy.tickInterval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }

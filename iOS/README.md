@@ -36,6 +36,7 @@ unchanged copy of the 330 MB model instead of copying it again.
 | `PARAKEET_BUNDLE_DIR` | empty | model bundle to embed |
 | `BUILD_DIR` | `build/$(PLATFORM)` | output directory |
 | `SWIFT_FLAGS` | empty | extra compiler flags, e.g. `-D LOCALFLOW_SELFTEST` |
+| `POWER_LOG` | `0` | `1` builds a power test build: the host app records a content-free power log ([POWER-TESTING.md](POWER-TESTING.md)); never for production |
 | `CODESIGN_IDENTITY`, `TEAM_ID`, `APP_PROFILE`, `KEYBOARD_PROFILE` | `-` on the simulator | device signing |
 
 Source lists (`APP_SWIFT_SOURCES`, `KEYBOARD_SWIFT_SOURCES`, `SHARED_SOURCES`, `KEYBOARDCORE_SOURCES`,
@@ -243,6 +244,7 @@ Setup and session:
 - [ ] Undo: removes exactly the dictation; disappears after typing, cursor moves, 30 s, or hiding the keyboard.
 - [ ] Kill LocalFlow during recording: the request reports interrupted and never restarts; no result file remains.
 - [ ] Battery: 30 min idle session vs no session (and vs Wispr Flow if installed).
+- [ ] Power test build (`POWER_LOG=1`): Diagnostics → Power shows the summary; Export shares the CSV files; Clear empties the log ([POWER-TESTING.md](POWER-TESTING.md)).
 - [ ] Peak memory during a 5-minute dictation; no jetsam in the background.
 
 Keyboard (compare side by side with Apple's keyboard in Try it → Cursor practice):

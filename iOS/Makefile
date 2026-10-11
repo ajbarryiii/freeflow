@@ -16,12 +16,20 @@ APP_PROFILE ?=
 KEYBOARD_PROFILE ?=
 BUILD_DIR ?= build/$(PLATFORM)
 SWIFT_FLAGS ?=
+# 1 builds a power test build: the host app (never the keyboard) gets
+# -D LOCALFLOW_POWER_LOG and records the content-free power log (POWER-TESTING.md).
+POWER_LOG ?= 0
 # Optional keychain holding the signing identity (device builds signed over SSH).
 CODESIGN_KEYCHAIN ?=
 CODESIGN_KEYCHAIN_FLAG = $(if $(strip $(CODESIGN_KEYCHAIN)),--keychain "$(CODESIGN_KEYCHAIN)")
 SWIFT_OPTIMIZATION ?= $(if $(strip $(PARAKEET_BUNDLE_DIR)),-O,-Onone)
 ICON_SOURCE ?= ../Resources/AppIcon-Dev-Source.png
 PYTHON ?= python3
+
+ifeq ($(filter 0 1,$(POWER_LOG)),)
+$(error POWER_LOG must be 0 or 1)
+endif
+APP_POWER_LOG_FLAGS = $(if $(filter 1,$(POWER_LOG)),-D LOCALFLOW_POWER_LOG)
 
 ifeq ($(PLATFORM),simulator)
 SDK = iphonesimulator
@@ -116,13 +124,22 @@ all: signing-requirements $(APP_SIGNATURE)
 binaries: $(APP_BINARY) $(KEYBOARD_BINARY)
 
 # Rebuild when identifiers, flags, signing inputs or source lists change.
-CONFIGURATION = $(PLATFORM)|$(BUNDLE_ID)|$(APP_GROUP)|$(URL_SCHEME)|$(DISPLAY_NAME)|$(DEPLOYMENT_TARGET)|$(SDK_PATH)|$(SWIFT_OPTIMIZATION)|$(SWIFT_FLAGS)|$(CODESIGN_IDENTITY)|$(TEAM_ID)|$(APP_PROFILE)|$(KEYBOARD_PROFILE)|$(ICON_SOURCE)|$(APP_SOURCES)|$(KEYBOARD_SOURCES)
-configuration:
+CONFIGURATION = $(PLATFORM)|$(BUNDLE_ID)|$(APP_GROUP)|$(URL_SCHEME)|$(DISPLAY_NAME)|$(DEPLOYMENT_TARGET)|$(SDK_PATH)|$(SWIFT_OPTIMIZATION)|$(SWIFT_FLAGS)|$(CODESIGN_IDENTITY)|$(TEAM_ID)|$(APP_PROFILE)|$(KEYBOARD_PROFILE)|$(ICON_SOURCE)|POWER_LOG=$(POWER_LOG)|$(APP_SOURCES)|$(KEYBOARD_SOURCES)
+configuration: $(CONFIG_STAMP)
+
+# The recipe belongs to the stamp itself, so make re-reads its time in the same
+# run: with the recipe on the phony target, make 3.81 (macOS) rebuilt only on
+# the next invocation, and a POWER_LOG=0 build could keep the recorder. A change
+# also deletes the binaries, because make 3.81 compares whole seconds and a
+# stamp written in the second a binary was linked would not look newer.
+$(CONFIG_STAMP): FORCE
 	@mkdir -p "$(OBJ_DIR)"
 	@printf '%s\n' "$(CONFIGURATION)" > "$(CONFIG_STAMP).tmp"
-	@if cmp -s "$(CONFIG_STAMP).tmp" "$(CONFIG_STAMP)"; then rm -f "$(CONFIG_STAMP).tmp"; else mv "$(CONFIG_STAMP).tmp" "$(CONFIG_STAMP)"; fi
+	@if cmp -s "$(CONFIG_STAMP).tmp" "$(CONFIG_STAMP)"; then rm -f "$(CONFIG_STAMP).tmp"; \
+	else mv "$(CONFIG_STAMP).tmp" "$(CONFIG_STAMP)" && rm -f "$(APP_BINARY)" "$(KEYBOARD_BINARY)"; fi
 
-$(CONFIG_STAMP): configuration
+.PHONY: FORCE
+FORCE:
 
 # Weights stay outside Git and are copied only into the local app bundle.
 parakeet-selection:
@@ -179,7 +196,7 @@ endif
 
 $(APP_BINARY): $(APP_SOURCES) $(CONFIG_STAMP) $(LINKED_APP_ENTITLEMENTS) Makefile
 	@mkdir -p "$(@D)"
-	$(SWIFTC) $(SWIFT_COMMON_FLAGS) $(SWIFT_OPTIMIZATION) -module-name LocalFlow \
+	$(SWIFTC) $(SWIFT_COMMON_FLAGS) $(SWIFT_OPTIMIZATION) $(APP_POWER_LOG_FLAGS) -module-name LocalFlow \
 		$(call embedded_entitlements,$(APP_ENTITLEMENTS)) -o "$@" $(APP_SOURCES)
 
 $(KEYBOARD_BINARY): $(KEYBOARD_SOURCES) $(CONFIG_STAMP) $(LINKED_KEYBOARD_ENTITLEMENTS) Makefile
@@ -233,8 +250,8 @@ endif
 
 check: typecheck test lint
 
-# Always against the simulator SDK, independent of PLATFORM. The self-test
-# variant is checked too, so it cannot rot outside smoke-sim.
+# Always against the simulator SDK, independent of PLATFORM. The self-test and
+# power-log variants are checked too, so they cannot rot outside their builds.
 typecheck:
 	@set -e; sdk=$$(xcrun --sdk iphonesimulator --show-sdk-path); \
 	flags="-typecheck -warnings-as-errors -swift-version 5 -parse-as-library -target arm64-apple-ios$(DEPLOYMENT_TARGET)-simulator -sdk $$sdk $(ACCELERATE_FLAGS) $(SWIFT_FLAGS)"; \
@@ -242,6 +259,8 @@ typecheck:
 	xcrun --sdk iphonesimulator swiftc $$flags -module-name LocalFlow $(APP_SOURCES); \
 	echo "Type-checking the app (self-test variant)"; \
 	xcrun --sdk iphonesimulator swiftc $$flags -D LOCALFLOW_SELFTEST -module-name LocalFlow $(APP_SOURCES); \
+	echo "Type-checking the app (power-log variant)"; \
+	xcrun --sdk iphonesimulator swiftc $$flags -D LOCALFLOW_POWER_LOG -module-name LocalFlow $(APP_SOURCES); \
 	echo "Type-checking the keyboard"; \
 	xcrun --sdk iphonesimulator swiftc $$flags $(KEYBOARD_SWIFT_FLAGS) $(KEYBOARD_SOURCES)
 
