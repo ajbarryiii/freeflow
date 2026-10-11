@@ -1,14 +1,15 @@
 import Foundation
 
 /// The power log summary (ARCHITECTURE.md, "Power log"): per-state totals, the background
-/// microphone drain against the inactive-gap baseline, the always-open projection, CPU per
+/// microphone drain and the inactive-gap baseline as two observed rates (never a projection), CPU per
 /// transcription, charging exclusion and the confidence threshold. All samples are invented.
 enum PowerLogSummaryTests {
     static var tests: [TestCase] {
         [
             ("emptyLog", testEmptyLog),
             ("perStateTimeCPUAndBattery", testPerStateTimeCPUAndBattery),
-            ("micOpenAgainstBaselineAndProjection", testMicOpenAgainstBaselineAndProjection),
+            ("observedRatesStayApart", testObservedRatesStayApart),
+            ("labelsSayWhatTheRatesAreNot", testLabelsSayWhatTheRatesAreNot),
             ("confidenceThreshold", testConfidenceThreshold),
             ("chargingIsExcludedFromDrain", testChargingIsExcludedFromDrain),
             ("unknownBatteryLevelIsExcludedFromDrain", testUnknownBatteryLevelIsExcludedFromDrain),
@@ -53,7 +54,6 @@ enum PowerLogSummaryTests {
             TestSupport.expectEqual(summary.inactive, PowerLogSummary.Totals())
             TestSupport.expectEqual(summary.micOpenBackground.percentPerHour, nil)
             TestSupport.expectEqual(summary.baseline.percentPerHour, nil)
-            TestSupport.expectEqual(summary.alwaysOpenPercentPerDay, nil)
             TestSupport.expectEqual(summary.transcriptions, 0)
             TestSupport.expectEqual(summary.cpuSecondsPerTranscription, nil)
         }
@@ -99,9 +99,10 @@ enum PowerLogSummaryTests {
         TestSupport.expectEqual(summary.sampleCount, samples.count)
     }
 
-    /// 2 h of background micOpen losing 10 points, then 4 h suspended losing 4 points:
-    /// (5 %/h − 1 %/h) × 24 = 96 % per day.
-    private static func testMicOpenAgainstBaselineAndProjection() {
+    /// 2 h of background micOpen losing 10 points, then 4 h suspended losing 4 points: two observed rates,
+    /// 5 %/h and 1 %/h. Their difference is not the microphone's cost (the screen differs), so the summary
+    /// offers no projection; only matched runs measure it.
+    private static func testObservedRatesStayApart() {
         var samples = [S.sample(0, .launch, level: 0.90)]
         samples += micOpenStretch(from: 10, minutes: 120, startLevel: 0.90, points: 10)
         let end = 10 + 120 * 60.0
@@ -116,7 +117,6 @@ enum PowerLogSummaryTests {
         expectClose(summary.baseline.seconds, 4 * 3600, "baseline seconds")
         expectClose(summary.baseline.percent, 4, "baseline drop")
         expectClose(summary.baseline.percentPerHour, 1, "baseline rate")
-        expectClose(summary.alwaysOpenPercentPerDay, 96, "projection")
         // Suspended time is never charged to a host state.
         expectClose(summary.states[.idle]?.seconds, 10, "foreground idle seconds")
     }
@@ -134,12 +134,17 @@ enum PowerLogSummaryTests {
         let enough = figure(minutes: 60, points: 3)
         TestSupport.expect(enough.isConfident, "exactly 1 h and 3 points is enough")
         expectClose(enough.percentPerHour, 3, "rate")
-        // The projection needs both figures.
-        let noBaseline = PowerLogSummary(samples: micOpenStretch(from: 0, minutes: 120, startLevel: 0.9, points: 10))
-        TestSupport.expect(noBaseline.micOpenBackground.isConfident, "micOpen figure")
-        TestSupport.expectEqual(noBaseline.alwaysOpenPercentPerDay, nil)
         TestSupport.expectEqual(PowerLogSummary.Drain.minimumSeconds, 3600)
         TestSupport.expectEqual(PowerLogSummary.Drain.minimumPercent, 3)
+    }
+
+    /// The exact wording the Diagnostics section shows (ARCHITECTURE.md, "No automatic projection" and
+    /// "Gaps").
+    private static func testLabelsSayWhatTheRatesAreNot() {
+        TestSupport.expectEqual(PowerLogSummary.observedDrainNote,
+                                "Observed whole-device drain; screen conditions differ. Microphone cost requires matched runs.")
+        TestSupport.expectEqual(PowerLogSummary.gapNote,
+                                "Gaps are uncontrolled: the phone may have charged in between, so this is not a measurement.")
     }
 
     private static func testChargingIsExcludedFromDrain() {

@@ -244,7 +244,7 @@ Setup and session:
 - [ ] Undo: removes exactly the dictation; disappears after typing, cursor moves, 30 s, or hiding the keyboard.
 - [ ] Kill LocalFlow during recording: the request reports interrupted and never restarts; no result file remains.
 - [ ] Battery: 30 min idle session vs no session (and vs Wispr Flow if installed).
-- [ ] Power test build (`POWER_LOG=1`): Diagnostics → Power shows the summary; Export shares the CSV files; Clear empties the log ([POWER-TESTING.md](POWER-TESTING.md)).
+- [ ] Power test build (`POWER_LOG=1`): Diagnostics → Power shows both observed rates with their notes; Export shares snapshot copies that are gone afterwards; Clear empties the log ([POWER-TESTING.md](POWER-TESTING.md)).
 - [ ] Peak memory during a 5-minute dictation; no jetsam in the background.
 
 Keyboard (compare side by side with Apple's keyboard in Try it → Cursor practice):

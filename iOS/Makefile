@@ -127,19 +127,22 @@ binaries: $(APP_BINARY) $(KEYBOARD_BINARY)
 CONFIGURATION = $(PLATFORM)|$(BUNDLE_ID)|$(APP_GROUP)|$(URL_SCHEME)|$(DISPLAY_NAME)|$(DEPLOYMENT_TARGET)|$(SDK_PATH)|$(SWIFT_OPTIMIZATION)|$(SWIFT_FLAGS)|$(CODESIGN_IDENTITY)|$(TEAM_ID)|$(APP_PROFILE)|$(KEYBOARD_PROFILE)|$(ICON_SOURCE)|POWER_LOG=$(POWER_LOG)|$(APP_SOURCES)|$(KEYBOARD_SOURCES)
 configuration: $(CONFIG_STAMP)
 
-# The recipe belongs to the stamp itself, so make re-reads its time in the same
-# run: with the recipe on the phony target, make 3.81 (macOS) rebuilt only on
-# the next invocation, and a POWER_LOG=0 build could keep the recorder. A change
-# also deletes the binaries, because make 3.81 compares whole seconds and a
-# stamp written in the second a binary was linked would not look newer.
-$(CONFIG_STAMP): FORCE
-	@mkdir -p "$(OBJ_DIR)"
-	@printf '%s\n' "$(CONFIGURATION)" > "$(CONFIG_STAMP).tmp"
-	@if cmp -s "$(CONFIG_STAMP).tmp" "$(CONFIG_STAMP)"; then rm -f "$(CONFIG_STAMP).tmp"; \
-	else mv "$(CONFIG_STAMP).tmp" "$(CONFIG_STAMP)" && rm -f "$(APP_BINARY)" "$(KEYBOARD_BINARY)"; fi
-
-.PHONY: FORCE
-FORCE:
+# Checked while this Makefile is read, before make looks at any file's time:
+# make 3.81 (macOS) caches times and compares whole seconds, so neither a newer
+# stamp nor a deletion during the build reliably forces a rebuild. A changed
+# configuration deletes everything built from it (binaries, entitlements, the
+# bundle signature) and then writes the stamp, so a POWER_LOG=0 build can never
+# keep a POWER_LOG=1 binary, however close together the two builds run.
+NO_BUILD_GOALS = check typecheck test lint clean smoke-sim smoke-device e2e-sim e2e-sim-probe e2e-sim-scenarios
+ifneq ($(filter-out $(NO_BUILD_GOALS),$(or $(MAKECMDGOALS),all)),)
+CONFIG_CHECK := $(shell mkdir -p "$(OBJ_DIR)" && printf '%s\n' "$(CONFIGURATION)" > "$(CONFIG_STAMP).tmp" && \
+	if cmp -s "$(CONFIG_STAMP).tmp" "$(CONFIG_STAMP)"; then rm -f "$(CONFIG_STAMP).tmp"; \
+	else rm -f "$(APP_BINARY)" "$(KEYBOARD_BINARY)" "$(APP_ENTITLEMENTS)" "$(KEYBOARD_ENTITLEMENTS)" "$(APP_SIGNATURE)" && \
+	mv "$(CONFIG_STAMP).tmp" "$(CONFIG_STAMP)"; fi >/dev/null 2>&1 || echo failed)
+ifneq ($(CONFIG_CHECK),)
+$(error Cannot update $(CONFIG_STAMP))
+endif
+endif
 
 # Weights stay outside Git and are copied only into the local app bundle.
 parakeet-selection:

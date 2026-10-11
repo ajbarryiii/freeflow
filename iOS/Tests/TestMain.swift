@@ -41,6 +41,7 @@ struct LocalFlowIOSTests {
             ("KeyTouchModel", KeyTouchModelTests.tests),
             ("PowerLog", PowerLogTests.tests),
             ("PowerLogSummary", PowerLogSummaryTests.tests),
+            ("PowerLogStore", PowerLogStoreTests.tests),
         ]
         var count = 0
         for (suite, tests) in suites {

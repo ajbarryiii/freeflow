@@ -13,9 +13,17 @@ import Foundation
 ///   longer than `maxAwakeInterval` (the 60 s timer did not fire, so the app was not really awake), or
 ///   when a run ended unannounced in an awake state (a crash or jetsam, with unknown timing).
 /// - Drain figures use only intervals that are unplugged at both ends, with known levels, and with no
-///   level rise (a rise means it charged in between).
+///   level rise (a rise means it charged in between). For a gap that is all the endpoints can show.
+/// - There is no projection of microphone cost: see `observedDrainNote`.
 struct PowerLogSummary: Equatable, Sendable {
     static let defaultMaxAwakeInterval: TimeInterval = 600
+
+    /// Shown with the two rates. There is no projection: a session needs the screen on and ends at lock,
+    /// while gaps include screen-off time, so their difference would mostly measure the display.
+    static let observedDrainNote =
+        "Observed whole-device drain; screen conditions differ. Microphone cost requires matched runs."
+    /// Shown with the gap figure: its endpoints cannot prove the phone stayed unplugged in between.
+    static let gapNote = "Gaps are uncontrolled: the phone may have charged in between, so this is not a measurement."
 
     struct Totals: Equatable, Sendable {
         var seconds = 0.0
@@ -49,9 +57,11 @@ struct PowerLogSummary: Equatable, Sendable {
     var runs = 0
     /// Awake time per host state. `idle` here is the app in front with no session.
     var states: [PowerHostState: Totals] = [:]
-    /// Time suspended or not running; its drain is the baseline.
+    /// Time suspended or not running. Its drain is the "LocalFlow inactive" figure, uncontrolled: only the
+    /// endpoints are known, so a charge in between that ends unplugged at a lower level goes unseen.
     var inactive = Totals()
-    /// The background microphone with no dictation: what an always-open session costs.
+    /// The background microphone with no dictation, as observed: whole-device drain with whatever screen
+    /// and use came with it, not the microphone's own cost.
     var micOpenBackground = Drain()
     var unknownSeconds = 0.0
     /// Time excluded from drain because the battery was not unplugged (or charged in between).
@@ -59,13 +69,6 @@ struct PowerLogSummary: Equatable, Sendable {
     var transcriptions = 0
 
     var baseline: Drain { Drain(seconds: inactive.drainSeconds, percent: inactive.drainPercent) }
-
-    /// "Always-open microphone ≈ (micOpen rate − baseline rate) × 24" in percent per day; nil until both
-    /// rates are confident.
-    var alwaysOpenPercentPerDay: Double? {
-        guard let open = micOpenBackground.percentPerHour, let base = baseline.percentPerHour else { return nil }
-        return (open - base) * 24
-    }
 
     var cpuSecondsPerTranscription: Double? {
         guard transcriptions > 0 else { return nil }

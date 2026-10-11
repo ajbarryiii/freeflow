@@ -38,44 +38,68 @@ In a power build, Diagnostics has a **Power (test build)** section.
 
 ## Collect
 
-The phone records whenever LocalFlow runs, so daily use already produces data.
-A fair, controlled comparison needs matched conditions, because the display
-usually costs more than the microphone.
+The phone records whenever LocalFlow runs, so daily use already produces data,
+but daily use only gives **observed** rates. The in-app figures are
+whole-device drain under whatever screen and use came with them. Sessions need
+the screen on, while gaps include screen-off nights. The microphone's cost
+comes only from **matched runs**: screen-on, a session against no session, with
+everything else equal. Gaps are also uncontrolled: the log cannot prove the
+phone stayed unplugged between two samples.
 
-LocalFlow ends a session when the phone locks and after at most 60 minutes
-without dictation. So the microphone can only stay open with the **screen on**,
+LocalFlow ends a session when the phone locks, and after at most 60 minutes
+without dictation. So the microphone can only stay open with the screen on,
 and the baseline must have the screen on too.
 
-1. Charge to at least 80 %, then unplug. Charging intervals never count.
-2. Fix the conditions for both runs and write them down:
-   - brightness (Auto-Brightness off)
-   - Settings → Display & Brightness → Auto-Lock: Never
-   - Wi-Fi, Bluetooth and Low Power Mode
-   - no media playing
-   - the same static screen in front, for example one Notes page
-3. **Run A, microphone open, at least 2 h.**
-   1. In LocalFlow, set Session length to 60 min and tap Start session.
-   2. Switch to the static screen and leave the phone untouched.
-   3. Dictate once every 50 minutes or so to keep the session alive; the log
-      separates the dictation from the open-microphone time.
-4. **Run B, baseline, at least 2 h.** End the session, or don't start one. Send
-   LocalFlow to the background, then use the same static screen for the same
-   time. Suspended time is logged as "LocalFlow inactive".
-5. Note the start and end times of each run and anything else that happened:
-   calls, other apps, a warm room, a change of network. Run A and B on the same
-   day and in alternating order if you repeat them.
-6. Optional: a screen-off baseline overnight, which shows the phone's own idle
+1. **Match the start.**
+   - Begin each run at the same charge, for example 80–85 %, unplugged.
+   - Begin at the same thermal state: let the phone cool to room temperature,
+     and check `thermal_state` is `nominal` in the endpoint row.
+   - Fix and write down:
+     - brightness (Auto-Brightness off)
+     - Settings → Display & Brightness → Auto-Lock: Never
+     - Wi-Fi, Bluetooth and Low Power Mode
+     - no media playing
+     - the same static screen, for example one Notes page
+2. **Warm the model first.** Open LocalFlow and dictate once before the first
+   run, so preparation (a Neural Engine compile after install) is not inside a
+   run. Then end the session.
+3. **Take an endpoint at every run boundary.** A suspended LocalFlow records
+   nothing, so open LocalFlow in front at each run's start and end. The
+   `foreground` row is the endpoint reading. Then send it to the background
+   (or Export), which flushes the log.
+4. **Run A, microphone open, about 55 minutes, no dictation.**
+   1. Open LocalFlow (the endpoint).
+   2. Set Session length to 60 min and tap Start session.
+   3. Switch to the static screen and leave the phone untouched.
+   4. Before the session expires, open LocalFlow again. That is the end
+      endpoint.
+   5. To continue, tap End session and Start session to begin the next segment.
+
+   Never dictate during Run A: a dictation is recording and transcription, not
+   microphone-only time. Do two or more segments.
+5. **Run B, baseline, the same length.**
+   1. Open LocalFlow with no session (the endpoint).
+   2. Send LocalFlow to the background and use the same static screen.
+   3. Open LocalFlow again at the end (the end endpoint).
+
+   Suspended time is logged as a gap.
+6. Alternate A and B on the same day (A, B, A, B), and write down each
+   boundary time. Also note anything that happened: calls, other apps, a warm
+   room, a change of network.
+7. Optional: a screen-off baseline overnight, which shows the phone's own idle
    drain.
 
-The in-app summary needs at least 1 h and a 3-point drop before it shows a
-rate. Its baseline uses all inactive time, including screen-off nights, so its
-always-open projection is only a first look. Use matched windows (below) for
-the real figure.
+The in-app rates need at least 1 h and a 3-point drop before they show. They
+read "Observed whole-device drain; screen conditions differ. Microphone cost
+requires matched runs." There is no projection. Compute the microphone's cost
+from the matched endpoints, as described in Analyze.
 
 ## Retrieve
 
-Export from the phone with Diagnostics → Power → Export log, which opens the
-share sheet with both files.
+First open LocalFlow in front for an endpoint reading, then send it to the
+background, which flushes the log. Or tap Diagnostics → Power → Export log,
+which flushes and shares snapshot copies of both files (deleted again when
+sharing ends).
 
 Or copy over the pairing from the Mac, which works over SSH. Use the device
 name from `xcrun devicectl list devices` and the app's `BUNDLE_ID`. Paths are
@@ -91,7 +115,9 @@ done
 ```
 
 The phone must be unlocked, or have been unlocked since it booted. The files
-are never in the App Group.
+are never in the App Group. Copying does not wake a suspended LocalFlow, so
+without the endpoint step above the last reading may be missing, or may come
+from much later.
 
 ## Analyze
 
@@ -125,8 +151,11 @@ consecutive rows belongs to the **first** row's state. The in-app summary
 - **Process runs.** A new run starts at a `launch` row, or where `uptime_s` or
   the CPU sum goes backwards. Within a run, use `uptime_s` differences; across
   runs only `wall_time` exists.
-- **Inactive.** An interval starting at a `terminate` row, or at
-  `background` + `idle`, is LocalFlow suspended or not running: the baseline.
+- **Inactive (gaps).** An interval starting at a `terminate` row, or at
+  `background` + `idle`, is LocalFlow suspended or not running. Its charging
+  history is unknown: the phone may have charged and come back below its
+  starting level. Gap rates are uncontrolled observations, never a
+  measurement; only gaps inside a run you watched (Run B) count.
 - **Unknown.** Awake states with no row for more than 10 minutes (the 60 s
   timer did not fire), and runs that ended without a `terminate` row while
   active, are unknown: leave them out.
@@ -138,8 +167,14 @@ consecutive rows belongs to the **first** row's state. The in-app summary
 
 Report:
 
-- For each controlled run (the times from Collect), the drain rate in %/h.
-  The open-microphone cost is rate(A) − rate(B), and × 24 for a day.
+- For each run segment, the drain from the endpoint row at its start to the one
+  at its end, in %/h. Find the endpoints by the boundary times from Collect;
+  they are `foreground` rows.
+- Check each Run A segment: `micOpen` throughout, with no `recording` or
+  `transcribing`.
+- The open-microphone cost is mean rate(A) − mean rate(B), with the spread
+  across segments. Scale it to a day only for an explicitly stated
+  screen-on duration, never × 24.
 - Per-state time, CPU seconds, and CPU seconds per transcription.
 - Memory peaks.
 - Thermal or Low Power Mode changes that may explain outliers.

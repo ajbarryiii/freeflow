@@ -2,11 +2,12 @@
 import SwiftUI
 import UIKit
 
-/// Diagnostics → Power, in test builds only (ARCHITECTURE.md, "Power log"): the summary and the
-/// always-open projection, the log's size and span, Export and Clear.
+/// Diagnostics → Power, in test builds only (ARCHITECTURE.md, "Power log"): two observed drain rates
+/// (never a projection), per-state totals, the log's size and span, Export and Clear.
 struct PowerLogSection: View {
     @State private var status: PowerRecorder.Status?
-    @State private var export: PowerLogExport?
+    @State private var export: PowerLogStore.Export?
+    @State private var exporting = false
     @State private var confirmingClear = false
 
     var body: some View {
@@ -15,12 +16,17 @@ struct PowerLogSection: View {
                 let summary = status.summary
                 LabeledContent("Logged", value: "\(spanText(summary.span)) · \(sizeText(status.bytesOnDisk))")
                     .accessibilityIdentifier("diagnostics.power.logged")
-                LabeledContent("Mic open, background", value: drainText(summary.micOpenBackground))
-                    .accessibilityIdentifier("diagnostics.power.micOpen")
-                LabeledContent("LocalFlow inactive", value: drainText(summary.baseline))
-                    .accessibilityIdentifier("diagnostics.power.baseline")
-                LabeledContent("Always-open mic", value: projectionText(summary.alwaysOpenPercentPerDay))
-                    .accessibilityIdentifier("diagnostics.power.projection")
+                VStack(alignment: .leading, spacing: 4) {
+                    LabeledContent("Mic open, background", value: drainText(summary.micOpenBackground))
+                        .accessibilityIdentifier("diagnostics.power.micOpen")
+                    LabeledContent("LocalFlow inactive (gaps)", value: drainText(summary.baseline))
+                        .accessibilityIdentifier("diagnostics.power.baseline")
+                    Text(PowerLogSummary.observedDrainNote)
+                        .font(.footnote).foregroundStyle(.secondary)
+                        .accessibilityIdentifier("diagnostics.power.observedNote")
+                    Text(PowerLogSummary.gapNote)
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
                 LabeledContent("CPU per transcription", value: transcriptionText(summary))
                 ForEach(PowerHostState.allCases, id: \.self) { state in
                     if let totals = summary.states[state] {
@@ -35,34 +41,53 @@ struct PowerLogSection: View {
                 if summary.unknownSeconds > 0 {
                     LabeledContent("Unaccounted", value: hoursText(summary.unknownSeconds)).font(.subheadline)
                 }
+                if status.droppedSamples > 0 {
+                    LabeledContent("Dropped (write failures)", value: "\(status.droppedSamples)").font(.subheadline)
+                }
             } else {
                 ProgressView()
             }
             Button("Export log") {
-                let urls = PowerRecorder.shared.filesForExport()
-                if !urls.isEmpty { export = PowerLogExport(urls: urls) }
-                Task { await reload() }
+                exporting = true
+                Task {
+                    export = await PowerRecorder.shared.exportSnapshot()
+                    exporting = false
+                    await reload()
+                }
             }
+            .disabled(exporting)
             .accessibilityIdentifier("diagnostics.power.export")
             Button("Clear log", role: .destructive) { confirmingClear = true }
                 .accessibilityIdentifier("diagnostics.power.clear")
         } header: {
             Text("Power (test build)")
         } footer: {
-            Text("Battery level, charging, thermal state, Low Power Mode, CPU time and memory, sampled each minute and at every change while LocalFlow runs; never audio or text. Stored on this iPhone only. Figures need at least 1 h and 3 % of drop, unplugged. LocalFlow's true share of total battery use is in Settings → Battery, which apps cannot read.")
+            Text("Battery level, charging, thermal state, Low Power Mode, CPU time and memory, sampled each minute and at every change while LocalFlow runs; never audio or text. Stored on this iPhone only. Rates need at least 1 h and 3 % of drop, unplugged. LocalFlow's true share of total battery use is in Settings → Battery, which apps cannot read.")
         }
         .task { await reload() }
-        .sheet(item: $export) { ActivityView(items: $0.urls) }
+        .sheet(item: $export, onDismiss: discardExport) { export in
+            ActivityView(items: export.files) { discardExport() }
+        }
         .confirmationDialog("Delete the power log?", isPresented: $confirmingClear, titleVisibility: .visible) {
             Button("Delete", role: .destructive) {
                 PowerRecorder.shared.clear()
+                status = nil
                 Task { await reload() }
             }
         }
     }
 
+    /// A reload that started before a Clear is dropped, so cleared data never reappears.
     private func reload() async {
-        status = await PowerRecorder.shared.status()
+        guard let latest = await PowerRecorder.shared.status(), PowerRecorder.shared.isCurrent(latest) else { return }
+        status = latest
+    }
+
+    /// The copies are deleted when sharing completes or the sheet goes away (and at the next launch).
+    private func discardExport() {
+        guard let current = export else { return }
+        export = nil
+        PowerRecorder.shared.discard(current)
     }
 
     private func stateLabel(_ state: PowerHostState) -> String {
@@ -79,10 +104,6 @@ struct PowerLogSection: View {
         let basis = String(format: "%.1f h, %.0f %%", drain.seconds / 3_600, drain.percent)
         guard let rate = drain.percentPerHour else { return "Not enough data (\(basis))" }
         return String(format: "%.2f %%/h", rate) + " (\(basis))"
-    }
-
-    private func projectionText(_ percentPerDay: Double?) -> String {
-        percentPerDay.map { String(format: "≈ %.0f %% per day", $0) } ?? "Not enough data"
     }
 
     private func transcriptionText(_ summary: PowerLogSummary) -> String {
@@ -112,18 +133,20 @@ struct PowerLogSection: View {
     }
 }
 
-private struct PowerLogExport: Identifiable {
-    let id = UUID()
-    let urls: [URL]
+extension PowerLogStore.Export: Identifiable {
+    var id: URL { directory }
 }
 
-/// The system share sheet for the log files (AirDrop, Files, Mail…). Nothing is sent unless the user
-/// picks a destination.
+/// The system share sheet for the snapshot copies (AirDrop, Files, Mail…). Nothing is sent unless the
+/// user picks a destination. `onComplete` runs when the user finishes or cancels.
 private struct ActivityView: UIViewControllerRepresentable {
     let items: [URL]
+    let onComplete: () -> Void
 
     func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: items, applicationActivities: nil)
+        let controller = UIActivityViewController(activityItems: items, applicationActivities: nil)
+        controller.completionWithItemsHandler = { _, _, _, _ in onComplete() }
+        return controller
     }
 
     func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}

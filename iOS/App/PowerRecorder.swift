@@ -7,36 +7,44 @@ import UIKit
 /// proxies to `Application Support/PowerLog` in the app's own container, never the App Group.
 ///
 /// It samples on every host-state and app-state transition, on battery, thermal and Low Power Mode
-/// notifications, at launch and termination, and from a 60 s timer. It never keeps the process awake:
-/// the timer is an ordinary run-loop timer that stops while iOS suspends the app, and no background task
-/// or audio is used on its behalf. Samples are buffered and written at most every 5 minutes, and at
-/// every background transition or termination.
+/// notifications, at launch and termination, and from a 60 s timer while background execution is
+/// justified: the app is in front, or the host holds an audio session or is working. When that stops
+/// (in the background with no session, for example after lock, idle expiry or End session) the boundary
+/// sample is flushed and the timer invalidated; sampling resumes on foreground or a new session. It
+/// never keeps the process awake and starts no background task.
+///
+/// The main thread only takes samples. Every file operation goes to `PowerLogStore`, the serialized
+/// owner on a utility queue. Rows are flushed at most every 5 minutes, and at every background
+/// transition, suspension boundary and termination.
 @MainActor
 final class PowerRecorder {
     static let shared = PowerRecorder()
 
     static let periodicInterval: TimeInterval = 60
     static let writeInterval: TimeInterval = 300
-    /// Bounds memory if writes keep failing (a full disk): the oldest buffered rows are dropped.
-    static let maxPendingSamples = 2_000
+    /// The termination flush may hold the main thread this long at most.
+    static let terminationWait: TimeInterval = 1
 
     static let directoryName = "PowerLog"
     static let fileName = "power-log.csv"
     static let rotatedFileName = "power-log.1.csv"
+    static let exportDirectoryName = "PowerLogExport"
 
-    /// What Diagnostics shows: the summary of everything logged, including rows not yet written.
+    /// What Diagnostics shows: everything logged, disk plus buffer, at one point in the store's order.
     struct Status: Sendable {
         var summary: PowerLogSummary
         var bytesOnDisk: Int
         var fileCount: Int
+        var droppedSamples: Int
+        var generation: UInt64
     }
 
-    private let directory: URL?
-    private let files: PowerLogFiles?
+    private let store: PowerLogStore?
+    /// Export copies, in the app's own temporary directory.
+    private let exportDirectory: URL
     private let build: String
     private let device: String
-    private var pending: [PowerSample] = []
-    private var lastWriteUptime: TimeInterval = 0
+    private var lastFlushUptime: TimeInterval = 0
     private var hostState = PowerHostState.idle
     private var computeUnits: @MainActor () -> ComputePolicy.Units? = { nil }
     private var timer: Timer?
@@ -44,11 +52,12 @@ final class PowerRecorder {
     private var isStarted = false
 
     private init() {
-        directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
-            .appendingPathComponent(Self.directoryName, isDirectory: true)
-        files = directory.map {
-            PowerLogFiles(directory: $0, fileName: Self.fileName, rotatedFileName: Self.rotatedFileName)
+        store = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first.map {
+            PowerLogStore(files: PowerLogFiles(directory: $0.appendingPathComponent(Self.directoryName, isDirectory: true),
+                                               fileName: Self.fileName, rotatedFileName: Self.rotatedFileName))
         }
+        exportDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(Self.exportDirectoryName, isDirectory: true)
         build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
         device = Self.hardwareModel()
     }
@@ -58,15 +67,10 @@ final class PowerRecorder {
         guard !isStarted else { return }
         isStarted = true
         self.computeUnits = computeUnits
-        lastWriteUptime = Self.uptime()
+        lastFlushUptime = Self.uptime()
+        store?.removeExports(in: exportDirectory)   // left by a run that died while sharing
         UIDevice.current.isBatteryMonitoringEnabled = true
         observeNotifications()
-        let timer = Timer(timeInterval: Self.periodicInterval, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.record(.periodic) }
-        }
-        timer.tolerance = 10
-        RunLoop.main.add(timer, forMode: .common)
-        self.timer = timer
         record(.launch)
     }
 
@@ -79,57 +83,72 @@ final class PowerRecorder {
         if isStarted { record(.state) }
     }
 
-    /// Writes buffered rows now (the user is exporting) and returns the files, oldest first.
-    func filesForExport() -> [URL] {
-        write(at: Self.uptime())
-        return files?.existingFiles ?? []
+    /// Diagnostics. Discard the result unless `isCurrent`: a Clear may have come in between.
+    func status() async -> Status? {
+        guard let store else { return nil }
+        return await withCheckedContinuation { continuation in
+            store.snapshot { snapshot in
+                continuation.resume(returning: Status(
+                    summary: PowerLogSummary(samples: snapshot.samples), bytesOnDisk: snapshot.bytesOnDisk,
+                    fileCount: snapshot.fileCount, droppedSamples: snapshot.droppedSamples, generation: snapshot.generation))
+            }
+        }
+    }
+
+    func isCurrent(_ status: Status) -> Bool {
+        store?.isCurrent(generation: status.generation) ?? false
+    }
+
+    /// Flushed, immutable copies for the share sheet; pass them to `discard` when sharing completes.
+    func exportSnapshot() async -> PowerLogStore.Export? {
+        guard let store else { return nil }
+        let directory = exportDirectory
+        return await withCheckedContinuation { continuation in
+            store.exportSnapshot(into: directory) { continuation.resume(returning: $0) }
+        }
+    }
+
+    func discard(_ export: PowerLogStore.Export) {
+        store?.removeExport(export)
     }
 
     func clear() {
-        pending.removeAll()
-        try? files?.clear()
-        lastWriteUptime = Self.uptime()
-    }
-
-    /// Reads and summarizes the log off the main thread.
-    func status() async -> Status {
-        let buffered = pending
-        guard let directory else {
-            return Status(summary: PowerLogSummary(samples: buffered), bytesOnDisk: 0, fileCount: 0)
-        }
-        let fileName = Self.fileName, rotatedFileName = Self.rotatedFileName
-        return await Task.detached(priority: .utility) {
-            let files = PowerLogFiles(directory: directory, fileName: fileName, rotatedFileName: rotatedFileName)
-            return Status(summary: PowerLogSummary(samples: files.readSamples() + buffered),
-                          bytesOnDisk: files.totalBytes, fileCount: files.existingFiles.count)
-        }.value
+        store?.clear()
     }
 
     // MARK: Private
 
     private func record(_ trigger: PowerTrigger) {
+        guard let store else { return }
         let now = Self.uptime()
-        pending.append(sample(trigger, uptime: now))
-        if pending.count > Self.maxPendingSamples { pending.removeFirst(pending.count - Self.maxPendingSamples) }
-        if trigger == .background || trigger == .terminate {
-            write(at: now)
-        } else if now - lastWriteUptime >= Self.writeInterval {
-            lastWriteUptime = now
-            // Never inside the host's publish call (a `.state` sample): the file work runs on the next turn.
-            DispatchQueue.main.async { [weak self] in
-                MainActor.assumeIsolated { self?.write(at: Self.uptime()) }
-            }
+        let sample = sample(trigger, uptime: now)
+        store.append(sample)
+        // Nothing but LocalFlow's own front or its audio session and work keeps it running.
+        let justified = sample.appState == .foreground || hostState != .idle
+        if trigger == .terminate {
+            store.flush()
+            store.waitUntilIdle(timeout: Self.terminationWait)
+            lastFlushUptime = now
+        } else if trigger == .background || !justified || now - lastFlushUptime >= Self.writeInterval {
+            store.flush()
+            lastFlushUptime = now
+        }
+        if justified, trigger != .terminate {
+            startTimer()
+        } else {
+            timer?.invalidate()
+            timer = nil
         }
     }
 
-    /// A failed write keeps the rows for the next attempt.
-    private func write(at now: TimeInterval) {
-        lastWriteUptime = now
-        guard let files, !pending.isEmpty else { return }
-        do {
-            try files.append(pending)
-            pending.removeAll()
-        } catch {}
+    private func startTimer() {
+        guard timer == nil else { return }
+        let timer = Timer(timeInterval: Self.periodicInterval, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.record(.periodic) }
+        }
+        timer.tolerance = 10
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
     }
 
     private func sample(_ trigger: PowerTrigger, uptime: TimeInterval) -> PowerSample {
