@@ -40,8 +40,9 @@ APP_POWER_LOG_FLAGS = $(if $(filter 1,$(POWER_LOG)),-D LOCALFLOW_POWER_LOG)
 # words there, and any word ending in -power refuses (conservative).
 POWER_SUFFIX = $(if $(filter 1,$(POWER_LOG)),-power)
 out_dir = $(1:%/=%)$(POWER_SUFFIX)
-# The power variant of a directory whatever POWER_LOG is, for clean.
-out_dir_power = $(1:%/=%)-power
+# A value as one single-quoted shell word, spaces and quotes kept (subst does not
+# collapse whitespace): for paths handed to the shell whole, as in clean.
+shell_quote = '$(subst ','\'',$(1))'
 OUT_DIR = $(call out_dir,$(BUILD_DIR))
 ifeq ($(POWER_LOG),0)
 ifneq ($(filter %-power,$(abspath $(BUILD_DIR))),)
@@ -434,6 +435,8 @@ E2E_KEEP_PRESENCE = $(strip $(E2E_BACKGROUND)$(E2E_FROM_BACKGROUND))
 # microphone (`say` speech, fed at real-time pace when a dictation starts) and
 # leaves it running for a GUI or scripted end-to-end test. It does not open
 # Simulator.app, and the Mac microphone is never used.
+# simctl needs an absolute log path: an absolute E2E_BUILD_DIR is used as
+# given, a relative one is resolved against the iOS directory.
 e2e-sim: SIM_DEVICE = $(E2E_SIM_DEVICE)
 e2e-sim:
 	@[ -n "$(strip $(PARAKEET_BUNDLE_DIR))" ] || { echo "e2e-sim needs PARAKEET_BUNDLE_DIR (the Parakeet model bundle)." >&2; exit 1; }
@@ -447,11 +450,12 @@ e2e-sim:
 	say -o "$(E2E_OUT_DIR)/obj/synthetic-mic.wav" --data-format=LEI16@16000 "$(E2E_PHRASE)"; \
 	mv "$(E2E_OUT_DIR)/obj/synthetic-mic.wav" "$$container/$(E2E_AUDIO)"; \
 	rm -f "$(E2E_LOG)"; \
+	log="$(E2E_LOG)"; case "$$log" in /*) ;; *) log="$(CURDIR)/$$log" ;; esac; \
 	SIMCTL_CHILD_LOCALFLOW_SYNTHETIC_MIC="$(E2E_AUDIO)" \
 	SIMCTL_CHILD_LOCALFLOW_SELFTEST_SKIP_ONBOARDING="$(E2E_SKIP_ONBOARDING)" \
 	SIMCTL_CHILD_LOCALFLOW_SELFTEST_SCREEN="$(E2E_SCREEN)" \
 	SIMCTL_CHILD_LOCALFLOW_SELFTEST_START_SESSION="$(E2E_START_SESSION)" \
-		xcrun simctl launch --terminate-running-process --stdout="$(CURDIR)/$(E2E_LOG)" \
+		xcrun simctl launch --terminate-running-process --stdout="$$log" \
 		"$$udid" "$(BUNDLE_ID)" >/dev/null; \
 	echo "LocalFlow (self-test build, synthetic microphone) is running on $(E2E_SIM_DEVICE) $$udid."; \
 	echo "  Window:        open -a Simulator --args -CurrentDeviceUDID $$udid"; \
@@ -569,6 +573,10 @@ e2e-sim-scenarios:
 	pass url-hint-stale
 
 clean:
-	@# Each directory is quoted as one whole path, spaces included.
-	rm -rf build "$(BUILD_DIR)" "$(call out_dir_power,$(BUILD_DIR))" "$(SMOKE_BUILD_DIR)" "$(call out_dir_power,$(SMOKE_BUILD_DIR))" \
-		"$(SMOKE_DEVICE_BUILD_DIR)" "$(call out_dir_power,$(SMOKE_DEVICE_BUILD_DIR))" "$(E2E_BUILD_DIR)" "$(call out_dir_power,$(E2E_BUILD_DIR))" "$(HOST_BUILD_DIR)"
+	@# Each directory reaches the shell as one exact path; its -power variant drops a
+	@# final / there, so repeated spaces, slashes and quotes survive intact.
+	rm -rf build $(call shell_quote,$(HOST_BUILD_DIR))
+	for d in $(call shell_quote,$(BUILD_DIR)) $(call shell_quote,$(SMOKE_BUILD_DIR)) \
+		$(call shell_quote,$(SMOKE_DEVICE_BUILD_DIR)) $(call shell_quote,$(E2E_BUILD_DIR)); do \
+		rm -rf "$$d" "$${d%/}-power"; \
+	done
