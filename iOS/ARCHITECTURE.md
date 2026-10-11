@@ -1246,3 +1246,96 @@ waits and deadlines. Each fix added more of it.
 order at the caret positions implied by the script, with an independent
 oracle. Cluster-boundary assertions apply only to gestures that no key
 interrupted.
+
+## Power log (test builds only; user decision 2026-10-10)
+
+**Purpose.** Estimate what an always-open microphone and transcription cost
+in battery during real daily use. iOS has no public per-app energy API and
+allows no separate daemon, so the host app records content-free proxies while
+it runs. Apple's Power Profiler (procedure in `iOS/POWER-TESTING.md`) gives
+exact per-category energy impact for short controlled runs. The two
+complement each other.
+
+**Build gate.** `make -C iOS POWER_LOG=1` adds `-D LOCALFLOW_POWER_LOG` to the
+host app only. Without it (the default, and every production build) the app
+contains no recorder, writes no power file and shows no Power section. A
+`POWER_LOG` change must invalidate the build (configuration stamp). The pure
+core in HostCore is compiled and tested in every `make check`, but nothing
+outside the gate calls it. Device test builds published to the OTA page set
+`POWER_LOG=1`. The keyboard extension is never instrumented.
+
+**Approval.** The user explicitly approved this local, content-free,
+test-build-only persistence on 2026-10-10. It is an exception to "no
+persistent logging" and must not reach a production build.
+
+**What is recorded.** One CSV row per sample, numbers and enums only. Never
+text, audio, transcripts, field or app context, or identifiers beyond the
+build number and the hardware model identifier:
+
+- wall time (ISO 8601 UTC) and monotonic uptime (seconds)
+- trigger: `periodic`, `state`, `battery`, `thermal`, `powerMode`, `launch`,
+  `foreground`, `background`, `terminate`
+- host state:
+  - `idle`: no audio session
+  - `micOpen`: audio session active, not capturing a dictation
+  - `recording`
+  - `transcribing`
+  - `preparing`: model load or compile
+- app state: `foreground` or `background`
+- battery level (raw `UIDevice.batteryLevel`, −1 when unknown), and battery
+  state: `unplugged`, `charging`, `full` or `unknown`
+- Low Power Mode, and thermal state: `nominal`, `fair`, `serious` or
+  `critical`
+- cumulative process CPU time, user and system, from `getrusage(RUSAGE_SELF)`
+- the process memory footprint (`ProcessMemory`)
+- compute units in use (the existing read-only value), when loaded
+
+**When.**
+- **Samples:** on every host-state and app-state transition, on battery
+  level/state, thermal and Low Power Mode notifications, at launch and at
+  termination, and every 60 s while the app runs.
+- **Probe cost:** the recorder samples only while something else (the app
+  in front, or an active audio session) keeps the process running. It never
+  keeps the process awake or delays suspension on its own, and adds no
+  wakeups beyond the 60 s timer. Samples are buffered and written at
+  most every 5 minutes, and on every background transition or termination.
+- **Gaps:** time the app was suspended or not running appears as a gap
+  between consecutive samples. The analysis treats a gap as the "LocalFlow
+  inactive" baseline.
+
+**Storage.** `Application Support/PowerLog/power-log.csv` in the app's own
+container, excluded from backup. It is never in the App Group: the keyboard
+cannot read it. It rotates at 4 MB to `power-log.1.csv` (one older file
+kept), and there is a Clear action. Nothing is transmitted. The file starts
+with a header row and a `# schema=1` comment line.
+
+**Pure core (HostCore, tested).**
+- **Model:** the sample model and CSV encoding (stable column order, `.`
+  decimal separator, no locale).
+- **Rotation:** the decision when to rotate.
+- **Summary:**
+  - per host state: total time, CPU seconds and battery percent consumed
+  - drain rate in percent per hour for `micOpen` in the background versus
+    the inactive-gap baseline
+  - the projection "always-open microphone ≈ (micOpen rate − baseline
+    rate) × 24 % per day"
+  - CPU seconds per transcription
+- **Charging:** intervals in which the battery state is not `unplugged` are
+  excluded from drain figures.
+- **Confidence:** a drain figure is shown only with at least 1 h of qualifying
+  time and at least 3 percentage points of drop. Otherwise it reads
+  "not enough data".
+
+**Diagnostics (test builds only).** A Power section shows:
+- the summary above, including the always-open projection
+- the log's size and its time span
+- **Export:** shares the CSV through the share sheet; when a rotated file
+  exists, both files are shared.
+- **Clear:** deletes the log.
+
+A note says that the app's true share of total battery use is in Settings →
+Battery, which an app cannot read.
+
+**Agent access.** An agent on the Mac can copy the log from a paired device
+with `xcrun devicectl device copy from --domain-type appDataContainer`.
+`iOS/POWER-TESTING.md` documents the exact command.
