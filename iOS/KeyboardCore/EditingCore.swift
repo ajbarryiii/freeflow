@@ -24,10 +24,16 @@ protocol AdjustmentOwner: AnyObject {
     func acknowledgeAsIssued(before: String?, after: String?) -> Bool
     /// `selectionDidChange`: whether it matches an adjustment still owed a callback; consumes nothing.
     func fits(before: String?, after: String?) -> Bool
+    /// When the oldest report a gesture (running or finished) may still send was issued, if any.
+    func oldestOwedReport(now: TimeInterval) -> TimeInterval?
+    /// No gesture runs: a callback is the oldest report the last one may still send. Consumes it.
+    func consumeLateReport(now: TimeInterval) -> Bool
 }
 
 extension AdjustmentOwner {
     func acknowledgeAsIssued(before: String?, after: String?) -> Bool { false }
+    func oldestOwedReport(now: TimeInterval) -> TimeInterval? { nil }
+    func consumeLateReport(now: TimeInterval) -> Bool { false }
 }
 
 /// The editing side's bookkeeping, independent of UIKit (ARCHITECTURE.md, "Undo ownership v2" and
@@ -40,7 +46,8 @@ extension AdjustmentOwner {
 /// - **Attribution.** A callback is the trackpad's only if it matches the expected outcome of an
 ///   adjustment still owed one (consumed once). A callback that shows the context one of our own
 ///   recent inserts or deletes left is a report of our edits (`ownEdit`, at most one per edit, within
-///   `ownEditLifetime`): never an outside change, so it never ends a gesture or anything typed.
+///   `ownEditLifetime`): never an outside change, so it never ends a gesture or anything typed. A
+///   report a gesture still owes is never taken for the echo of an edit made after its adjustment.
 ///   Anything else is an outside change.
 /// - **Dictation undo**, through `UndoTracker`, never while text is selected, and failing closed:
 ///   every callback that is not a pending trackpad adjustment's own ends it for good, our own edits'
@@ -129,8 +136,15 @@ final class EditingCore {
             return .own
         }
         // Reports arrive in order: those of our own edits come before those of a gesture begun after
-        // them, and one of them can look like a gesture's outcome (a probe not yet landed).
-        if consumeOwnEdit(Self.state(before: before, after: after), now: now) {
+        // them, and one of them can look like a gesture's outcome (a probe not yet landed). A report a
+        // gesture still owes comes before the echo of any edit made after its adjustment was issued
+        // (ARCHITECTURE.md, "Typing model v2": late gesture reports are never echoes). While it runs, only
+        // edits made before that may be echoed now. Once it has finished, no callback is an echo until
+        // its reports have come: deleting what was typed can bring back the very state an earlier edit
+        // left, and an owed report showing it is no echo of that edit.
+        let owedSince = adjustments?.oldestOwedReport(now: now)
+        let cutoff = adjustments?.isActive == true ? owedSince : owedSince.map { _ in -TimeInterval.infinity }
+        if consumeOwnEdit(Self.state(before: before, after: after), madeBefore: cutoff, now: now) {
             undo.invalidate()
             return .ownEdit
         }
@@ -138,7 +152,9 @@ final class EditingCore {
            textChanged ? adjustments.acknowledge(before: before, after: after) : adjustments.fits(before: before, after: after) {
             return .own
         }
-        // Nothing of ours: the undo is gone, and so is anything bound to the document as it was.
+        // Nothing of ours explains it: the undo is gone, and so is anything bound to the document as it
+        // was. A report a finished gesture still owed is no different, but it is no longer awaited.
+        _ = adjustments?.consumeLateReport(now: now)
         undo.invalidate()
         generation &+= 1
         return .outside
@@ -154,10 +170,12 @@ final class EditingCore {
 
     /// A report showing what one of our recent edits left. Each edit owes at most one report, and a
     /// report shows the field as it is when it arrives (after later edits, too), so it may show any of
-    /// the states still owed; it settles the oldest.
-    private func consumeOwnEdit(_ state: String, now: TimeInterval) -> Bool {
+    /// the states still owed; it settles the oldest. Only edits made before `madeBefore` (a gesture's
+    /// report still owed) can be reported yet.
+    private func consumeOwnEdit(_ state: String, madeBefore owedSince: TimeInterval?, now: TimeInterval) -> Bool {
         ownEdits.removeAll { now - $0.at > Self.ownEditLifetime || now < $0.at }
-        guard ownEdits.contains(where: { $0.state == state }) else { return false }
+        let reportable = ownEdits.filter { edit in owedSince.map { edit.at < $0 } ?? true }
+        guard reportable.contains(where: { $0.state == state }) else { return false }
         ownEdits.removeFirst()
         return true
     }

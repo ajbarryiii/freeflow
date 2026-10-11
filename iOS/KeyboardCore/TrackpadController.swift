@@ -37,6 +37,11 @@ final class TrackpadController: AdjustmentOwner {
     /// Reports the last session in this field was still owed when it ended (a key ended it at once), by
     /// issue time: the next session expects them first.
     private var owedReports: (documentID: UUID, times: [TimeInterval])?
+    /// Every report the last session in this field may still send (`TrackpadSession.lateReports`), by
+    /// issue time, for at most `lateReportLifetime`: none is ever the echo of a later edit.
+    private var lateReports: (documentID: UUID, times: [TimeInterval])?
+    /// How long after it was issued a finished session's adjustment may still be reported.
+    static let lateReportLifetime: TimeInterval = 1
     var parameters = TrackpadParameters.standard
     /// The current edit generation, owned by `EditingCore`.
     var currentGeneration: () -> Int = { 0 }
@@ -47,6 +52,8 @@ final class TrackpadController: AdjustmentOwner {
     /// During `onFinished` of a session a key ended (`interrupt`) only: the text before the caret where
     /// its last move lands (`TrackpadSession.landingBefore`), which the proxy may not show yet.
     private(set) var finishedLanding: String?
+    /// During `onFinished` only: a key ended the session (`interrupt`).
+    private(set) var finishedByKey = false
 
     init(host: TrackpadHost) {
         self.host = host
@@ -112,6 +119,8 @@ final class TrackpadController: AdjustmentOwner {
         lastTimestamp = max(lastTimestamp, timestamp)
         guard let session else { return }
         let completed = isValid && !session.isCancelled
+        finishedByKey = true
+        defer { finishedByKey = false }
         finish(completed: completed, landing: completed ? session.landingBefore : nil)
     }
 
@@ -135,6 +144,7 @@ final class TrackpadController: AdjustmentOwner {
         unitCache = nil
         reportsCache = nil
         owedReports = nil
+        lateReports = nil
         if let session, !session.isSettled {
             isHiding = true
             return
@@ -160,8 +170,15 @@ final class TrackpadController: AdjustmentOwner {
         self.session = session
     }
 
-    /// The keyboard appeared anew: whatever was left ends at once, a watch since hiding included.
+    /// Whatever is left ends at once, a watch since hiding included.
     func stop() {
+        finish(completed: false)
+    }
+
+    /// The keyboard appeared anew. A watch kept since hiding goes on in the same field (it holds no text and
+    /// has its own limit; the jump it watches may only now show where it stopped); anything else ends.
+    func appeared() {
+        if isHiding, let session, session.isCancelled, let host, let documentID, host.documentID == documentID { return }
         finish(completed: false)
     }
 
@@ -201,6 +218,31 @@ final class TrackpadController: AdjustmentOwner {
         session?.fits(before: before, after: after) ?? false
     }
 
+    /// When the oldest report a gesture may still send was issued: the running session's, or the last
+    /// finished one's in this field (within `lateReportLifetime`). Reports arrive in order, so an edit
+    /// made after it cannot be echoed before that report has arrived.
+    func oldestOwedReport(now: TimeInterval) -> TimeInterval? {
+        if let session { return session.lateReports.first }
+        guard var late = lateReports, let host, host.documentID == late.documentID else { return nil }
+        late.times.removeAll { now - $0 > Self.lateReportLifetime }
+        lateReports = late.times.isEmpty ? nil : late
+        return late.times.first
+    }
+
+    /// No gesture runs, and the last one in this field may still send a report: a callback nothing
+    /// else explains is the oldest of them (ARCHITECTURE.md, "Typing model v2": never an echo). It
+    /// confirms nothing and still counts as an outside change; the next gesture no longer waits for it.
+    func consumeLateReport(now: TimeInterval) -> Bool {
+        guard session == nil, oldestOwedReport(now: now) != nil, var late = lateReports else { return false }
+        late.times.removeFirst()
+        lateReports = late.times.isEmpty ? nil : late
+        if var owed = owedReports, !owed.times.isEmpty {
+            owed.times.removeFirst()
+            owedReports = owed.times.isEmpty ? nil : owed
+        }
+        return true
+    }
+
     /// The field and the generation are still the ones the gesture started on. While a hidden keyboard
     /// finishes watching a cancelled jump, or a session guards the boundary after an outside change,
     /// only the field counts: hiding and the outside change advanced the generation.
@@ -220,6 +262,10 @@ final class TrackpadController: AdjustmentOwner {
         }
         if let documentID, !session.owedReports.isEmpty {
             owedReports = (documentID, session.owedReports)
+        }
+        if let documentID {
+            let late = session.lateReports
+            lateReports = late.isEmpty ? nil : (documentID, late)
         }
         finishedLanding = landing
         self.session = nil

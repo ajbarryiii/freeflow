@@ -14,6 +14,8 @@ enum TypingRulesTests {
             ("autoCapitalizationModes", testAutoCapitalizationModes),
             ("contextTailTracksOwnEdits", testContextTailTracksOwnEdits),
             ("contextTailYieldsToTheProxy", testContextTailYieldsToTheProxy),
+            ("contextTailKnowsAReadingFromBeforeItsEdits", testContextTailKnowsAReadingFromBeforeItsEdits),
+            ("contextTailOnUnverifiedReadings", testContextTailOnUnverifiedReadings),
             ("contextTailYieldsToAProxyThatMovedOn", testContextTailYieldsToAProxyThatMovedOn),
             ("contextTailExpiresAndTypingCannotExtendIt", testContextTailExpiresAndTypingCannotExtendIt),
         ]
@@ -255,6 +257,52 @@ enum TypingRulesTests {
         TestSupport.expectEqual(tail.current(proxyBefore: "\n"), "Line one.\n")
         tail.proxyChanged(before: "\n")
         TestSupport.expectEqual(tail.known, "Line one.\n")
+    }
+
+    private static func testContextTailKnowsAReadingFromBeforeItsEdits() {
+        // Found by the typing torture (seed 1240): a gesture's landing was " ", and the proxy, still showing
+        // the caret before the move, happened to end with " " too; taken as showing the landing, the model
+        // went and later typing was modeled on the stale reading. A reading from before an edit or a move
+        // never shows it.
+        var tail = ContextTail()
+        tail.moved(before: " ", proxyBefore: "Line.\n \n ", at: 1)
+        TestSupport.expectEqual(tail.known, " ")
+        TestSupport.expectEqual(tail.current(proxyBefore: "Line.\n \n "), " ")
+        tail.inserted("P", proxyBefore: "Line.\n \n ", at: 1)
+        TestSupport.expectEqual(tail.current(proxyBefore: "Line.\n \n "), " P")
+    }
+
+    private static func testContextTailOnUnverifiedReadings() {
+        // After a key abandoned a probe (seeds 63, 1284, 1402): the proxy's reading may not show where the
+        // host put the caret. What is typed on it is modeled on it, the best estimate; a proxy that shows
+        // what was typed is newer whatever precedes it; deleting into the reading leaves the proxy to answer.
+        var tail = ContextTail()
+        tail.typedOnUnverified("F", reading: "Line one\n", at: 1)
+        TestSupport.expectEqual(tail.current(proxyBefore: "Line one\n"), "Line one\nF")
+        TestSupport.expectEqual(tail.current(proxyBefore: "ine one\n\n"), "Line one\nF")
+        TestSupport.expectEqual(tail.current(proxyBefore: "Line one\n\nF"), "Line one\n\nF")
+        tail.deleted(graphemes: 1, proxyBefore: "Line one\n", at: 1)
+        TestSupport.expectEqual(tail.known, nil)
+        // Once the proxy shows what was typed, the model goes entirely (seed 4026): a deletion is taken from
+        // the proxy, not from the stale reading.
+        tail.typedOnUnverified("a", reading: "ed texMq", at: 1)
+        tail.deleted(graphemes: 1, proxyBefore: "a", at: 1)
+        TestSupport.expectEqual(tail.known, "")
+        // A gesture's landing: a proxy showing something else than the landing and what was typed on it
+        // answers (seed 2105); deletions into it go on from it (a host that shows edits late keeps showing it).
+        tail.moved(before: "KHv ", proxyBefore: "Mku\n", at: 1)
+        tail.inserted("x", proxyBefore: "Mku\n", at: 1)
+        TestSupport.expectEqual(tail.current(proxyBefore: "Mku\n"), "KHv x")
+        TestSupport.expectEqual(tail.current(proxyBefore: "w\nMku\nx"), "w\nMku\nx")
+        // A reading from before the edit never shows it, even ending with what was typed (seed 6822).
+        tail.forget()
+        tail.moved(before: "pzz\n", proxyBefore: "pzz\n", at: 1)
+        tail.inserted("\n", proxyBefore: "pzz\n", at: 1)
+        TestSupport.expectEqual(tail.current(proxyBefore: "pzz\n"), "pzz\n\n")
+        tail.forget()
+        tail.moved(before: "Done. ", proxyBefore: "Done. Two", at: 1)
+        tail.deleted(graphemes: 1, proxyBefore: "Done. Two", at: 1)
+        TestSupport.expectEqual(tail.known, "Done.")
     }
 
     private static func testContextTailYieldsToTheProxy() {

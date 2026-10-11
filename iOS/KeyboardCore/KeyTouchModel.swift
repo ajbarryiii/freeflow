@@ -9,7 +9,8 @@ import Foundation
 /// - Rollover: a new finger first commits every key still held by earlier fingers, in press order:
 ///   characters, space and return alike. A committed space no longer becomes the trackpad.
 /// - Characters, space and return type on lift (or rollover); shift and layer keys on touch-down;
-///   delete starts repeating on touch-down.
+///   delete starts repeating on touch-down. Every key's touch-down first ends trackpad settlement
+///   (`keyDown`).
 /// - Each finger keeps the field the keyboard served when it touched down (or, touched down before any
 ///   identity, the first one identified after); what it types carries that field, so the keyboard can
 ///   refuse it in another identified one (ARCHITECTURE.md, "Typing model v2").
@@ -39,6 +40,9 @@ struct KeyTouchModel: Equatable, Sendable {
     }
 
     enum Effect: Equatable, Sendable {
+        /// A key touched down (any key but the globe): trackpad settlement ends now, before whatever the
+        /// key does at once or at its release (ARCHITECTURE.md, "Typing model v2").
+        case keyDown
         /// `field`: the field the finger touched down in (nil for keys acting at once).
         case type(KeyAction, field: UUID? = nil)
         case beginDelete
@@ -81,10 +85,12 @@ struct KeyTouchModel: Equatable, Sendable {
     /// `field`: the field the keyboard serves at this touch-down.
     mutating func began(_ id: TouchID, x: Double, y: Double, field: UUID? = nil) -> [Effect] {
         guard trackpadTouch == nil, let action = nearestAction(x: x, y: y) else { return [] }
-        var effects = commitPending()
+        // The globe is a UIKit button with its own touches; a touch that lands near it is ignored.
+        if action == .nextKeyboard { return commitPending() }
+        var effects: [Effect] = [.keyDown] + commitPending()
         var touch = Touch(id: id, role: .character, action: action, startX: x, startY: y, x: x, y: y, field: field)
         switch action {
-        case .character:
+        case .character, .nextKeyboard:
             break
         case .space:
             touch.role = .space
@@ -100,9 +106,6 @@ struct KeyTouchModel: Equatable, Sendable {
         case .layer:
             touch.role = .layer
             effects.append(.type(action))
-        case .nextKeyboard:
-            // The globe is a UIKit button with its own touches; a touch that lands near it is ignored.
-            return effects
         }
         touches.append(touch)
         return effects

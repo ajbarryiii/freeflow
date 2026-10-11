@@ -2,6 +2,8 @@ import UIKit
 
 @MainActor
 protocol KeyAreaViewDelegate: AnyObject {
+    /// A key touched down (any key but the globe), before anything it does: trackpad settlement ends.
+    func keyAreaTouchedDownKey(_ keyArea: KeyAreaView, timestamp: TimeInterval)
     /// A key acted: characters, space and return on touch-up or rollover; shift and layer keys on
     /// touch-down; delete here only from VoiceOver (a held delete uses the begin and end calls).
     /// `field`: the field the keyboard served when the finger touched down (`currentField`).
@@ -251,6 +253,8 @@ final class KeyAreaView: UIView {
     private func perform(_ effects: [KeyTouchModel.Effect], timestamp: TimeInterval) {
         for effect in effects {
             switch effect {
+            case .keyDown:
+                delegate?.keyAreaTouchedDownKey(self, timestamp: timestamp)
             case .type(let action, let field):
                 delegate?.keyArea(self, typed: action, field: field, timestamp: timestamp)
             case .beginDelete:

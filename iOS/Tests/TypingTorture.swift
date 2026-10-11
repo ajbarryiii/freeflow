@@ -2,23 +2,26 @@ import Foundation
 
 /// The typing torture test (ARCHITECTURE.md, "Typing model v2: immediate execution"): a seeded script of
 /// touches (taps, holds, rollover; shift, caps lock, layers; space, double space, return, delete),
-/// trackpad gestures (keys at the lift, letters while a probe is out, outside changes and hiding while
-/// one settles), focus changes between two fields (keys typed before the new field's first callback,
-/// fingers held across), fields without an identity (fingers held through nil → A → B), hiding, the
-/// host app's own edits, caret moves and selections, against hosts with lagging adjustments, short,
-/// long or missing callbacks, WebKit's double reports and proxy contexts that lag the keyboard's edits.
+/// trackpad gestures (keys at the lift, letters while a probe is out, Shift and layer keys among them,
+/// outside changes and hiding while one settles), focus changes between two fields (keys typed before
+/// the new field's first callback, fingers held across), fields without an identity (fingers held
+/// through nil → A → B), hiding, the host app's own edits, caret moves and selections, against hosts with
+/// lagging adjustments, short, long or missing callbacks, WebKit's double reports and proxy contexts that
+/// lag the keyboard's edits. Documents are compared as UTF-16 code units, as UIKit keeps them.
 ///
 /// The oracle computes the expected documents, carets, selections, shift and layer from the script
 /// alone, with its own statement of the contract's rules (`OracleRules`, `OracleTyping`): a key edits the
-/// field the proxy serves the moment it is typed, with the shift and layer of that moment, unless it was
-/// pressed in another identified field; casing and the double-space period follow the text before the
-/// caret. A gesture whose target the script knows (a whole-context field, a span of one-unit characters)
-/// lands exactly there, keys at its lift included. Where the contract leaves the caret to the host (a
-/// gesture that needs probes, an outside change while one runs), the oracle takes the host's caret after
-/// checking that nothing else changed: keys typed into such a gesture are all there, once, in order,
-/// together, anywhere (inside a cluster too, the accepted residual), their letters in either case; a
-/// gesture no key interrupted ends on a character boundary. Every step that needs the keyboard settled
-/// fails when it never settles. Deterministic per seed.
+/// field the proxy serves the moment it is released (a held key is committed in press order when
+/// another touches down), with the shift and layer of that moment, unless it was pressed in another
+/// identified field; casing and the double-space period follow the text before the caret. Every edit is
+/// checked right after its release. A gesture whose target the script knows (a whole-context field, a
+/// span of one-unit characters) lands exactly there, keys at its lift included. For a free gesture a key
+/// interrupted, only where the first key acts comes from the host (its caret once what the gesture issued
+/// has landed, inside a cluster too: the accepted residual); the shift there follows what the keyboard can
+/// read (the gesture's landing, or the proxy when a probe's outcome is abandoned), and every key is
+/// checked exactly, case included. A gesture no key interrupted ends on a character boundary, with the
+/// text unchanged but for an outside change. Every step that needs the keyboard settled fails when it
+/// never settles. Deterministic per seed.
 struct TypingTorture {
     struct Failure: Equatable {
         var step: Int
@@ -199,16 +202,17 @@ private struct OracleTyping {
     }
 }
 
-/// A field as the oracle expects it.
+/// A field as the oracle expects it, in UTF-16 code units as the host keeps it: a key inside a surrogate
+/// pair (the accepted residual) leaves both halves, and deleting it rejoins them.
 private struct OracleField {
-    var text: String
+    var units: [UInt16]
     var caret: Int
     var selection = 0
 
-    var before: String {
-        let units = Array(text.utf16)
-        return String(decoding: units[..<min(caret, units.count)], as: UTF16.self)
-    }
+    /// As a Swift string: a lone surrogate half reads as U+FFFD, one unit, so offsets agree.
+    var text: String { String(decoding: units, as: UTF16.self) }
+
+    var before: String { String(decoding: units[..<min(caret, units.count)], as: UTF16.self) }
 
     /// UTF-16 offsets of every character boundary.
     var boundaries: [Int] {
@@ -224,7 +228,6 @@ private struct OracleField {
     /// caret; insert in place of the selection.
     mutating func apply(deletes: Int, text inserted: String) {
         for _ in 0 ..< deletes {
-            var units = Array(text.utf16)
             if selection > 0 {
                 units.removeSubrange(caret ..< caret + selection)
                 selection = 0
@@ -234,12 +237,9 @@ private struct OracleField {
                 units.removeSubrange(start ..< caret)
                 caret = start
             }
-            text = String(decoding: units, as: UTF16.self)
         }
         guard !inserted.isEmpty else { return }
-        var units = Array(text.utf16)
         units.replaceSubrange(caret ..< caret + selection, with: Array(inserted.utf16))
-        text = String(decoding: units, as: UTF16.self)
         caret += inserted.utf16.count
         selection = 0
     }
@@ -269,6 +269,21 @@ private final class TortureWorld {
     private var inGesture = false
     private var logLimit: Int { tracing ? 2_000 : 40 }
     private var lastKeyAt: TimeInterval = -.infinity
+    /// The first disagreement seen right after an edit, reported at the end of the step.
+    private var failure: String?
+    /// Host callbacks delivered while no gesture ran: none is a gesture's own report, and the torture's
+    /// host never echoes our edits, so each one starts the space and shift timing over.
+    private var freeDeliveries = 0
+    /// While the keys typed after a key ended a free gesture run: the field's text before this offset is
+    /// text the keyboard has not been shown. With a probe or a jump abandoned that is all of it before the
+    /// first key's insertion point, since the proxy's reading may not show where the host had the caret;
+    /// with the gesture's landing known, the text before the window the proxy showed. A caret at or before
+    /// it (deletions reach there) is cased from the proxy's context, which, on a host that shows our edits
+    /// at once, is the field's own text there; everything typed after it is cased from the field's text.
+    private var unknown: Int?
+    /// From a key ending a free gesture until the first edit: the text before the caret as the keyboard
+    /// reads it then (the landing, or the proxy's reading), which Shift and layer keys before that edit see.
+    private var interruptContext: String?
 
     private func note(_ event: String) {
         var line = String(format: "%.3f ", time - 100) + event
@@ -310,7 +325,7 @@ private final class TortureWorld {
             hosts.append(host)
             modes[id] = random.pick([AutocapitalizationMode.sentences, .sentences, .none, .words, .allCharacters])
             wholeContext[id] = model == .whole
-            fields[id] = OracleField(text: host.text, caret: host.caret)
+            fields[id] = OracleField(units: host.units, caret: host.caret)
         }
         self.random = random
         self.ids = ids
@@ -323,11 +338,14 @@ private final class TortureWorld {
         keyboardField = ids[0]
         harness = KeyboardHarness(hosts[0], autocapitalization: modes[ids[0]]!, documentID: ids[0])
         update()
+        harness.onDeliver = { [unowned self] gestureRunning in
+            if !gestureRunning { self.freeDeliveries += 1 }
+        }
         if tracing {
             harness.onFrame = { [unowned self] in
                 guard self.inGesture else { return }
                 let host = self.harness.document.host
-                self.note("frame: trackpad \(self.harness.trackpad.isActive ? "on" : "off"), caret \(host.caret), proxy "
+                self.note("frame: trackpad \(self.harness.trackpad.isActive ? "on" : "off") unit \(self.harness.trackpad.session?.unit.map { "\($0)" } ?? "-"), caret \(host.caret), proxy "
                     + "\(String((self.harness.document.contextBefore ?? "").suffix(8)).debugDescription), \(host.traceDescription), "
                     + "outcomes \(self.harness.outcomes.suffix(2))")
             }
@@ -355,6 +373,7 @@ private final class TortureWorld {
         default: message = shiftOrLayerStep()
         }
         if let message { return message }
+        if let failure { return failure }
         // Half the time, everything settles and is compared; otherwise the next step interleaves.
         return random.chance(0.5) ? settleAndCheck() : nil
     }
@@ -375,8 +394,23 @@ private final class TortureWorld {
     }
 
     private func settleAndCheck() -> String? {
+        if let failure { return failure }
         guard quiet() else { return "the keyboard never settled" }
-        return check()
+        return failure ?? check()
+    }
+
+    /// Right after a key's release (or its rollover commit, or a held delete's deletion): the field the
+    /// proxy serves already holds the edit, at the oracle's caret (ARCHITECTURE.md, "Typing model v2":
+    /// keys execute immediately). The first disagreement is kept for the step's result.
+    private func verify(after event: String) {
+        guard failure == nil else { return }
+        let host = harness.document.host, expected = fields[shown]!
+        if host.units != expected.units {
+            failure = "right after \(event), field \(name(shown)): \(host.text.debugDescription) != expected \(expected.text.debugDescription)"
+        } else if host.caret != expected.caret || host.selectionLength != expected.selection {
+            failure = "right after \(event), field \(name(shown)): caret \(host.caret)+\(host.selectionLength) != expected "
+                + "\(expected.caret)+\(expected.selection)"
+        }
     }
 
     // MARK: Keys
@@ -469,16 +503,19 @@ private final class TortureWorld {
     private func touchDown(_ action: KeyAction) -> KeyTouchModel.TouchID {
         guard let point = harness.center(action) else { preconditionFailure("the script pressed \(action), not shown") }
         // A new finger commits every earlier one still held: characters, space and return.
+        var committed = false
         for (id, held) in bindings.sorted(by: { $0.key < $1.key }) where !held.committed {
             switch (held.role, held.action) {
             case (.character, .character?), (.space, .space?), (.returnKey, .returnKey?):
                 bindings[id]?.committed = true
-                type(held.action!, binding: held.field)
+                type(held.action!, binding: held.field, verifying: false)
+                committed = true
             default:
                 break
             }
         }
         let id = harness.touchDown(action)
+        if committed { verify(after: "rollover") }
         let role: Role
         switch action {
         case .character: role = .character
@@ -552,7 +589,8 @@ private final class TortureWorld {
     /// A key reaches the editor: pressed in another identified field, it is cancelled; otherwise it edits
     /// the field the proxy serves, now. A field the proxy serves before its first callback is taken as
     /// current first.
-    private func type(_ action: KeyAction, binding: UUID?) {
+    private func type(_ action: KeyAction, binding: UUID?, verifying: Bool = true) {
+        defer { if verifying { verify(after: "\(action)") } }
         lastKey = action
         lastKeyAt = time
         note("key \(action) bound \(name(binding)) in \(name(current)) shift \(typing.shift) (keyboard: \(harness.editor.typing.shift)) layer \(typing.layer)")
@@ -560,12 +598,15 @@ private final class TortureWorld {
         if current != keyboardField { fieldChanged() }
         let edit = typing.resolve(action, before: fields[shown]!.before, at: time)
         fields[shown]!.apply(deletes: edit.deletes, text: edit.text)
+        if edit.deletes > 0 || !edit.text.isEmpty { interruptContext = nil }
+        if let offset = unknown, edit.deletes > 0 { unknown = min(offset, fields[shown]!.caret) }
         update()
     }
 
     /// The keyboard took another field (or none) as current: fingers held before any identity bind to
     /// it, those bound to another identified field end; the space and shift timing starts over.
     private func fieldChanged() {
+        note("the keyboard takes \(name(current)) as current")
         keyboardField = current
         if let field = current {
             for (id, held) in bindings where !held.committed {
@@ -595,8 +636,18 @@ private final class TortureWorld {
         }
     }
 
+    /// Auto-capitalization from the text before the caret: the field's own text, except where no keyboard
+    /// can know it (`unknown`), where it is what the keyboard can read.
     private func update() {
-        typing.update(OracleRules.capitalizes(after: fields[shown]!.before, mode: modes[shown]!))
+        if let context = interruptContext {
+            typing.update(OracleRules.capitalizes(after: context, mode: modes[shown]!))
+            return
+        }
+        if let offset = unknown, fields[shown]!.caret <= offset {
+            typing.update(OracleRules.capitalizes(after: harness.document.contextBefore ?? "", mode: modes[shown]!))
+        } else {
+            typing.update(OracleRules.capitalizes(after: fields[shown]!.before, mode: modes[shown]!))
+        }
     }
 
     // MARK: Gestures
@@ -622,12 +673,23 @@ private final class TortureWorld {
         let dx = predictable ? Double(targetColumn - column) * 10 : Double(random.below(161) - 80)
         let dy = predictable ? Double(targetLine - line) * 20 : Double(random.below(81) - 40)
         // What happens around the lift: keys (at the lift of a predictable gesture; while a free one
-        // settles, letters during probes included), an outside change, hiding, or nothing. Never a space
-        // or shift: what follows a gesture starts its space and shift timing anew.
+        // settles, letters during probes included; Shift and layer keys among them, whose touch-down ends
+        // the gesture too), an outside change, hiding, or nothing. Never a space: what follows a gesture
+        // starts its space timing anew.
         enum Around { case nothing, keys(Int), outside, hide }
+        // Keys follow a free gesture only on a host whose behavior leaves them knowable. A host whose
+        // reports come after `syncTimeout` is outside the trackpad's guarantees (a probe resolved by timeout
+        // may learn the wrong unit, so where a move lands is not known). On a host that shows our edits
+        // late, after a key abandons a probe nothing shows the text before the insertion point until the
+        // proxy catches up, so keys typed in that instant cannot be cased from it.
+        let reporting = harness.document.host
+        let reportsInTime = reporting.callbackFrames.map {
+            Double($0 + reporting.lagFrames) / 120 < TrackpadParameters.standard.syncTimeout
+        } ?? true
+        let knowable = reportsInTime && reporting.editContextLagFrames == 0
         let around: Around
         switch random.below(10) {
-        case 0 ..< 4: around = .keys(1 + random.below(4))
+        case 0 ..< 4: around = predictable || knowable ? .keys(1 + random.below(4)) : .nothing
         case 4: around = predictable ? .nothing : .outside
         case 5: around = predictable ? .nothing : .hide
         default: around = .nothing
@@ -660,7 +722,7 @@ private final class TortureWorld {
             show()
         }
         // Keys at the lift, or while it settles: picked as they are pressed, from the layer shown then.
-        var typed: [KeyAction] = []
+        // Each edit is checked right after its release (`verify`).
         if case .keys(let count) = around {
             if predictable {
                 // The move is in flight or landed: as far as keys are concerned, the caret is the target.
@@ -668,62 +730,47 @@ private final class TortureWorld {
                 update()
             } else {
                 harness.frames(random.below(8))
+                placeAtInterruption(field)
             }
             for _ in 0 ..< count {
-                let key: KeyAction = random.chance(0.2) ? .delete : random.pick(typedKeys(space: false))
-                typed.append(key)
-                touchUp(touchDown(key))
+                touchUp(touchDown(gestureKey()))
             }
+            unknown = nil
+            interruptContext = nil
+            // Every report of the gesture a key ended arrives with no gesture running: a callback that is
+            // not an echo, which starts the timing over (ARCHITECTURE.md, "Typing model v2").
+            let deliveries = freeDeliveries
+            guard quiet() else { return "the keyboard never settled after a gesture" }
+            if freeDeliveries > deliveries { typing.resetTiming() }
+            // The proxy now shows the field as it is, and the shift follows it (after an own edit it does
+            // every frame, with no callback): from the field's own text again.
+            update()
+            if predictable, harness.document.host.caret != fields[field]!.caret {
+                return "keys at the lift of a gesture to \(target) left the caret at \(harness.document.host.caret)"
+            }
+            return nil
         }
         guard quiet() else { return "the keyboard never settled after a gesture" }
         let host = harness.document.host
+        // No key was typed since the gesture began, so its timing has only the shift's automatic decision
+        // to start over, whatever the callbacks were.
         defer {
-            // Reports of a gesture a key ended arrive as callbacks that are not echoes of our edits.
             typing.resetTiming()
             update()
         }
         if predictable {
-            // Exactly at the target; the keys at the lift landed there, in the oracle's own casing.
-            if typed.isEmpty { fields[field]!.caret = target }
-            if host.caret != fields[field]!.caret {
-                return "a gesture to \(target) left the caret at \(host.caret)"
-            }
-            return nil
-        }
-        if case .keys = around {
-            // Wherever the host had the caret when the first key ended the gesture, inside a cluster
-            // included: all of them there, once, in order, together; letters in either case.
-            var matched: OracleField?
-            for start in 0 ... oracleField.text.utf16.count {
-                var candidate = oracleField
-                candidate.caret = start
-                var edits = OracleTyping()
-                var low = start
-                for key in typed {
-                    let edit = edits.resolve(key, before: candidate.before, at: time)
-                    candidate.apply(deletes: edit.deletes, text: edit.text)
-                    low = min(low, candidate.caret - edit.text.utf16.count)
-                }
-                if candidate.caret == host.caret,
-                   Self.matches(host.text, candidate.text, caseInsensitiveFrom: low, to: candidate.caret) {
-                    matched = candidate
-                    break
-                }
-            }
-            guard var placed = matched else {
-                return "keys typed while a gesture settled were not all there, in order, at one caret: "
-                    + "\(host.text.debugDescription) from \(oracleField.text.debugDescription) with \(typed)"
-            }
-            placed.text = host.text
-            fields[field] = placed
+            fields[field]!.caret = target
+            if host.caret != target { return "a gesture to \(target) left the caret at \(host.caret)" }
             return nil
         }
         // No key interrupted it: the caret is the host's, on a character boundary, and only an outside
-        // change changed the text.
-        guard host.caretIsOnBoundary || !startedOnBoundary && host.caret == oracleField.caret else {
+        // change changed the text. A host whose reports come after `syncTimeout` is outside the trackpad's
+        // guarantees: a jump past the window's edge resolved by timeout, from a provisional answer that
+        // shows the caret at that edge, may have stopped inside a hidden cluster.
+        guard host.caretIsOnBoundary || !reportsInTime || !startedOnBoundary && host.caret == oracleField.caret else {
             return "a gesture left the caret inside a character at \(host.caret)"
         }
-        guard host.text == fields[field]!.text else {
+        guard host.units == fields[field]!.units else {
             return "a gesture changed the text: \(host.text.debugDescription) != \(fields[field]!.text.debugDescription)"
         }
         fields[field]!.caret = host.caret
@@ -731,15 +778,52 @@ private final class TortureWorld {
         return nil
     }
 
-    /// The candidate equals the host's text, letters between `start` and `end` (the keys typed) in
-    /// either case.
-    private static func matches(_ host: String, _ candidate: String, caseInsensitiveFrom start: Int, to end: Int) -> Bool {
-        let hostUnits = Array(host.utf16), candidateUnits = Array(candidate.utf16)
-        guard hostUnits.count == candidateUnits.count, end <= candidateUnits.count else { return false }
-        guard hostUnits[..<start] == candidateUnits[..<start], hostUnits[end...] == candidateUnits[end...] else { return false }
-        let typedHost = String(decoding: hostUnits[start ..< end], as: UTF16.self)
-        let typedCandidate = String(decoding: candidateUnits[start ..< end], as: UTF16.self)
-        return typedHost.lowercased() == typedCandidate.lowercased()
+    /// A key typed around a gesture: a character or Return from the layer shown, delete, Shift, or a
+    /// layer key.
+    private func gestureKey() -> KeyAction {
+        switch random.below(10) {
+        case 0, 1: return .delete
+        case 2:
+            let switches = keys { action in
+                if case .layer = action { return true }
+                return action == .shift
+            }
+            return switches.isEmpty ? .delete : random.pick(switches)
+        default: return random.pick(typedKeys(space: false))
+        }
+    }
+
+    /// The first key after a free gesture's lift ends it at its touch-down (ARCHITECTURE.md, "Typing
+    /// model v2"). Only where the keys act comes from the host: the caret once what the gesture already
+    /// issued has landed (observed on a copy, so nothing lands early). The shift follows the text the
+    /// keyboard can read there: where the gesture's last move lands (the field's own text before that
+    /// caret), or, with a probe or a jump out whose outcome is abandoned (or the gesture already over),
+    /// the proxy's context. Every key from here on is checked exactly, case included (`unknown`
+    /// states the one limit).
+    private func placeAtInterruption(_ field: UUID) {
+        let session = harness.trackpad.session
+        let caret = harness.document.host.caretOnceAdjusted
+        fields[field]!.caret = caret
+        typing.resetTiming()
+        if session != nil, let landing = session?.landingBefore {
+            // The landing is the window of the field's own text the proxy showed before that caret, unless
+            // the gesture lost track of where the host put it (WebKit's double reports with provisional
+            // answers and lag; a gesture that began inside a cluster): then the keyboard has seen none of
+            // the text before the caret, and the proxy, which shows the field on a host where keys follow a
+            // free gesture, decides once something is typed.
+            let seen = fields[field]!.before.hasSuffix(landing)
+            if !seen { note("the gesture's landing \(landing.debugDescription) is not where the host put the caret") }
+            unknown = seen ? caret - landing.utf16.count : caret
+            interruptContext = landing
+            typing.update(OracleRules.capitalizes(after: landing, mode: modes[field]!))
+        } else {
+            // A probe or a jump abandoned: the proxy's reading. Only a key that ends a running gesture
+            // abandons an outcome; one that settled left the proxy showing where it put the caret.
+            unknown = session != nil ? caret : nil
+            interruptContext = harness.document.contextBefore ?? ""
+            typing.update(OracleRules.capitalizes(after: interruptContext!, mode: modes[field]!))
+        }
+        note("placed at \(caret), shift from the \(session?.landingBefore != nil ? "landing" : "proxy")")
     }
 
     private func lineStarts(_ text: String) -> [Int] {
@@ -778,17 +862,13 @@ private final class TortureWorld {
             let at = random.pick(boundaries)
             let inserted = random.pick(["zz", "Hi. ", "\n", "\u{1F44D}", "e\u{301}"])
             harness.document.hostInserts(inserted, at: at, reportAfter: 1 + random.below(3))
-            var units = Array(oracleField.text.utf16)
-            units.insert(contentsOf: Array(inserted.utf16), at: at)
-            oracleField.text = String(decoding: units, as: UTF16.self)
+            oracleField.units.insert(contentsOf: Array(inserted.utf16), at: at)
         case 1:
             guard boundaries.count > 2 else { return }
             let first = random.below(boundaries.count - 1)
             let range = boundaries[first] ..< boundaries[min(first + 1 + random.below(3), boundaries.count - 1)]
             harness.document.hostDeletes(range, reportAfter: 1 + random.below(3))
-            var units = Array(oracleField.text.utf16)
-            units.removeSubrange(range)
-            oracleField.text = String(decoding: units, as: UTF16.self)
+            oracleField.units.removeSubrange(range)
         default:
             harness.document.moveCaret(to: random.pick(boundaries), reportedAsTextChange: random.chance(0.5))
         }
@@ -812,17 +892,13 @@ private final class TortureWorld {
             let inserted = random.pick(["zz", "Hi. ", "\n", "\u{1F44D}", "e\u{301}"])
             harness.document.hostInserts(inserted, at: at, reportAfter: turns)
             if at <= oracleField.caret { oracleField.caret += inserted.utf16.count }
-            var units = Array(oracleField.text.utf16)
-            units.insert(contentsOf: Array(inserted.utf16), at: at)
-            oracleField.text = String(decoding: units, as: UTF16.self)
+            oracleField.units.insert(contentsOf: Array(inserted.utf16), at: at)
         case 1:
             guard boundaries.count > 2 else { return nil }
             let first = random.below(boundaries.count - 1)
             let range = boundaries[first] ..< boundaries[min(first + 1 + random.below(3), boundaries.count - 1)]
             harness.document.hostDeletes(range, reportAfter: turns)
-            var units = Array(oracleField.text.utf16)
-            units.removeSubrange(range)
-            oracleField.text = String(decoding: units, as: UTF16.self)
+            oracleField.units.removeSubrange(range)
             if oracleField.caret >= range.upperBound {
                 oracleField.caret -= range.count
             } else if oracleField.caret > range.lowerBound {
@@ -967,7 +1043,7 @@ private final class TortureWorld {
         for id in ids {
             let host = id == shown ? harness.document.host : parked[id]!
             let expected = fields[id]!
-            if host.text != expected.text {
+            if host.units != expected.units {
                 return "field \(name(id)): \(host.text.debugDescription) != expected \(expected.text.debugDescription)"
             }
             if id == shown, host.caret != expected.caret || host.selectionLength != expected.selection {

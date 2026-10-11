@@ -62,8 +62,11 @@ enum TrackpadSessionTests {
             ("ambiguousSessionGuardingASplitStillEnds", testAmbiguousSessionGuardingASplitStillEnds),
             ("preMoveReportSuspendsMovement", testPreMoveReportSuspendsMovement),
             ("outsideChangeLeavingASplitIsRepaired", testOutsideChangeLeavingASplitIsRepaired),
+            ("guardOutlastsAnotherOutsideChange", testGuardOutlastsAnotherOutsideChange),
+            ("unheardAdjustmentIsGuarded", testUnheardAdjustmentIsGuarded),
             ("guardWaitsForAWholeClusterBoundary", testGuardWaitsForAWholeClusterBoundary),
             ("guardRepairsOnlyFromALandedContext", testGuardRepairsOnlyFromALandedContext),
+            ("edgeWatchRepairsOnlyFromALandedContext", testEdgeWatchRepairsOnlyFromALandedContext),
             ("contextBehindTheCaretIsNoNewSnapshot", testContextBehindTheCaretIsNoNewSnapshot),
             ("staleExpectationsAreRetired", testStaleExpectationsAreRetired),
             ("cancellingReleasesTheLaidOutText", testCancellingReleasesTheLaidOutText),
@@ -1199,6 +1202,51 @@ extension TrackpadSessionTests {
         TestSupport.expect(document.host.caretIsOnBoundary, "left inside the emoji")
     }
 
+    fileprivate static func testGuardOutlastsAnotherOutsideChange() {
+        // A second outside change while the guard watches the boundary changes nothing: the guard goes on
+        // until the caret is on a whole-cluster boundary.
+        let document = FakeDocument(FakeTextHost(text: "Hi \u{1F44D} there", unit: .utf16))
+        let controller = TrackpadController(host: document)
+        controller.parameters = .flat
+        controller.begin(layout: FixedWidthLayout(columns: 1_000), linePitch: 20, layoutWidth: 10_000)
+        controller.move(dx: -30, dy: 0, timestamp: 1)
+        controller.tick(at: 1)
+        document.host.moveCaret(to: 4)
+        controller.abort()
+        controller.abort()
+        TestSupport.expect(controller.isActive, "a second outside change ended the guard")
+        var time = 1.0
+        while controller.isActive, time < 3 {
+            time += 1.0 / 120
+            controller.tick(at: time)
+        }
+        TestSupport.expect(document.host.caretIsOnBoundary, "left inside the emoji")
+    }
+
+    fileprivate static func testUnheardAdjustmentIsGuarded() {
+        // An outside change while a move is still to land: the field shows no split yet, but the move,
+        // landing after the change, stops inside the emoji the change put there. The guard watches it.
+        let document = FakeDocument(FakeTextHost(text: "Hi there", unit: .utf16, lagFrames: 3, callbackFrames: 3))
+        let controller = TrackpadController(host: document)
+        controller.parameters = .flat
+        controller.begin(layout: FixedWidthLayout(columns: 1_000), linePitch: 20, layoutWidth: 10_000)
+        controller.move(dx: -30, dy: 0, timestamp: 1)
+        controller.tick(at: 1)
+        TestSupport.expectEqual(document.host.adjustmentCount, 1)
+        document.host.hostInsert("\u{1F44D}", at: 6)
+        controller.abort()
+        TestSupport.expect(controller.isActive, "ended with a move still to land")
+        var time = 1.0
+        while controller.isActive, time < 3 {
+            time += 1.0 / 120
+            document.host.advanceFrame()
+            while let report = document.host.takeCallback() { _ = controller.acknowledge(before: report.before, after: report.after) }
+            controller.tick(at: time)
+        }
+        for _ in 0 ..< 10 { document.host.advanceFrame() }
+        TestSupport.expect(document.host.caretIsOnBoundary, "left inside the emoji at \(document.host.caret)")
+    }
+
     fileprivate static func testGuardWaitsForAWholeClusterBoundary() {
         // After an outside change, the gesture's watch ends only once the field shows the caret on a
         // whole-cluster boundary: a split it already tried to repair keeps it watching, up to its limit,
@@ -1244,6 +1292,34 @@ extension TrackpadSessionTests {
         TestSupport.expect(host.caretIsOnBoundary, "left inside the emoji at \(host.caret)")
         TestSupport.expectEqual(host.caret, 6)
         TestSupport.expect(time < 1.6, "the guard ran out its time")
+    }
+
+    fileprivate static func testEdgeWatchRepairsOnlyFromALandedContext() {
+        // The round-9 residual: a cancelled jump's edge watch repaired a split it saw while an adjustment
+        // was still in flight (+1 here); the two landed in turn and brought back the context already
+        // repaired in, leaving the caret inside the emoji. Like the guard, it repairs only once what was
+        // issued has landed.
+        let host = FakeTextHost(text: "ab\u{1F44D}\u{1F3FD}cd\nnext line", caret: 0, unit: .utf16, window: 2)
+        var session = makeSession(host)
+        session.drag(dx: 0, dy: 20)
+        TestSupport.expectEqual(session.frame(before: host.context.before, after: host.context.after, timestamp: 1), 3)
+        // The field as the cancellation finds it: the caret between the halves of 👍, a +1 still to land.
+        var field = FakeTextHost(text: "ab\u{1F44D}cd", caret: 3, unit: .utf16, lagFrames: 3, callbackFrames: 3)
+        field.adjust(by: 1)
+        TestSupport.expectEqual(session.cancel(at: 1), nil)
+        var time = 1.0
+        while !session.isFinished(at: time), time < 3 {
+            time += 1.0 / 120
+            field.advanceFrame()
+            while let report = field.takeCallback() { _ = session.acknowledge(before: report.before, after: report.after) }
+            let context = field.context
+            if let offset = session.frame(before: context.before, after: context.after, timestamp: time), offset != 0 {
+                field.adjust(by: offset)
+            }
+        }
+        for _ in 0 ..< 10 { field.advanceFrame() }
+        TestSupport.expect(field.caretIsOnBoundary, "left inside the emoji at \(field.caret)")
+        TestSupport.expectEqual(field.caret, 4)
     }
 
     fileprivate static func testContextBehindTheCaretIsNoNewSnapshot() {

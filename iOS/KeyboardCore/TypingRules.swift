@@ -186,6 +186,11 @@ enum DoubleSpacePeriod {
 /// anything else (it caught up, and the model was built on a reading that was itself behind), the
 /// proxy answers. Memory only, a bounded tail, forgotten on any outside change, once the proxy shows
 /// it, and at the latest `lifetime` after it was first held: more typing never extends that.
+///
+/// After a key abandoned a probe, the proxy's reading may not show where the host has the caret: a model
+/// built on it marks that reading unverified (`typedOnUnverified`). Casing reads all of it, the best
+/// estimate there is, but a proxy that shows what was typed is newer, whatever it shows before it, and a
+/// deletion that reaches the unverified reading leaves the proxy to answer.
 struct ContextTail: Equatable, Sendable {
     static let limit = 256
     static let lifetime: TimeInterval = 10
@@ -198,29 +203,65 @@ struct ContextTail: Equatable, Sendable {
     /// left it: a proxy reading one of these has not caught up yet.
     private var readingsBefore: [String] = []
     private var earlierModels: [String] = []
+    /// How many graphemes at the start of the model come from a reading that may not show where the caret
+    /// is (nil: none).
+    private(set) var unverified: Int?
 
     /// When the model must be forgotten, if one is held.
     var expiresAt: TimeInterval? { knownSince.map { $0 + Self.lifetime } }
 
     /// The best estimate of the text before the caret.
     func current(proxyBefore: String?) -> String? {
-        guard let known else { return proxyBefore }
-        if Self.shows(proxyBefore, known) { return proxyBefore }
+        modelAnswers(proxyBefore) ? known : proxyBefore
+    }
+
+    /// Whether the model, not the proxy, tells the text before the caret for this reading.
+    private func modelAnswers(_ proxyBefore: String?) -> Bool {
+        guard let known else { return false }
         let proxy = proxyBefore ?? ""
+        // Exactly what the proxy read before one of our edits or moves: it has not shown that one yet, even
+        // if it happens to end with the model (a short landing such as " ") or with what was typed.
+        if readingsBefore.contains(proxy) { return true }
+        // Typed on an unverified reading: a reading that shows what was typed is newer (a callback forgets the
+        // model anyway).
+        if let unverified, known.count > unverified {
+            return !proxy.hasSuffix(String(known.dropFirst(unverified)))
+        }
+        if Self.shows(proxyBefore, known) { return false }
         // A shorter view of the same text (a window that starts at the last line break), or the field as
-        // it was before one of our edits: the model knows more.
+        // an earlier edit left it: the model knows more.
         let narrower = known.hasSuffix(proxy)
-        let behind = readingsBefore.contains(proxy) || earlierModels.contains { !$0.isEmpty && proxy.hasSuffix($0) }
-        return narrower || behind ? known : proxyBefore
+        let behind = earlierModels.contains { !$0.isEmpty && proxy.hasSuffix($0) }
+        return narrower || behind
+    }
+
+    /// `typed` inserted on `reading`, a proxy reading that may not show where the host had the caret.
+    mutating func typedOnUnverified(_ typed: String, reading: String?, at time: TimeInterval) {
+        forget()
+        guard !typed.isEmpty else { return }
+        let full = (reading ?? "") + typed
+        hold(String(full.suffix(Self.limit)), readingBefore: reading, at: time)
+        unverified = max(0, (known?.count ?? 0) - typed.count)
     }
 
     mutating func inserted(_ text: String, proxyBefore: String?, at time: TimeInterval) {
+        // A proxy that shows what was typed on an unverified start is newer: the model goes.
+        if unverified != nil, !modelAnswers(proxyBefore) { forget() }
         let base = current(proxyBefore: proxyBefore) ?? ""
-        hold(String((base + text).suffix(Self.limit)), readingBefore: proxyBefore, at: time)
+        let full = base + text
+        hold(String(full.suffix(Self.limit)), readingBefore: proxyBefore, at: time)
+        if let count = unverified { unverified = max(0, count - (full.count - (known?.count ?? 0))) }
     }
 
     mutating func deleted(graphemes count: Int, proxyBefore: String?, at time: TimeInterval) {
+        // A proxy that shows what was typed on an unverified start is newer: the model goes.
+        if unverified != nil, !modelAnswers(proxyBefore) { forget() }
         guard let base = current(proxyBefore: proxyBefore) else {
+            forget()
+            return
+        }
+        // Reaching an abandoned probe's reading: what is before the caret is not known.
+        if let unverified, base.count - count <= unverified {
             forget()
             return
         }
@@ -284,6 +325,7 @@ struct ContextTail: Equatable, Sendable {
 
     mutating func forget() {
         known = nil
+        unverified = nil
         knownSince = nil
         readingsBefore = []
         earlierModels = []
@@ -292,7 +334,7 @@ struct ContextTail: Equatable, Sendable {
     /// Releases the model once the proxy shows it: the proxy is then the only copy, so the typed text
     /// is not held a moment longer than the edit that needed it.
     mutating func acknowledge(proxyBefore: String?) {
-        guard let known, Self.shows(proxyBefore, known) else { return }
+        guard let known, Self.shows(proxyBefore, known), !readingsBefore.contains(proxyBefore ?? "") else { return }
         forget()
     }
 }

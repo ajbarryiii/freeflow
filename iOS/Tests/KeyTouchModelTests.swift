@@ -41,7 +41,7 @@ enum KeyTouchModelTests {
     private static func testCharactersTypeOnLift() {
         var model = model()
         let a = center(.character("a")), s = center(.character("s"))
-        TestSupport.expectEqual(model.began(1, x: a.x, y: a.y), [])
+        TestSupport.expectEqual(model.began(1, x: a.x, y: a.y), [.keyDown])
         // Sliding to another key types the key under the finger at lift.
         TestSupport.expectEqual(model.moved(1, x: s.x, y: s.y), [])
         TestSupport.expectEqual(model.ended(1, x: s.x, y: s.y), [.type(.character("s"))])
@@ -58,7 +58,7 @@ enum KeyTouchModelTests {
         let q = center(.character("q")), returnKey = center(.returnKey), numbers = center(.layer(.numbers))
         _ = model.began(1, x: q.x, y: q.y)
         _ = model.moved(1, x: returnKey.x, y: returnKey.y)
-        TestSupport.expectEqual(model.began(2, x: numbers.x, y: numbers.y), [.type(.layer(.numbers))])
+        TestSupport.expectEqual(model.began(2, x: numbers.x, y: numbers.y), [.keyDown, .type(.layer(.numbers))])
         // The view rebuilds the keys for the new layer; held fingers follow by action, not index.
         TestSupport.expectEqual(model.keysChanged(keys(.numbers), layer: .numbers), [])
         TestSupport.expectEqual(keys(.numbers).count, 30)
@@ -73,8 +73,8 @@ enum KeyTouchModelTests {
         // "hello x". The space commits first, in press order, and its hold timer stops.
         var model = model()
         let space = center(.space), x = center(.character("x"))
-        TestSupport.expectEqual(model.began(1, x: space.x, y: space.y), [.startHoldTimer(1)])
-        TestSupport.expectEqual(model.began(2, x: x.x, y: x.y), [.cancelHoldTimer(1), .type(.space)])
+        TestSupport.expectEqual(model.began(1, x: space.x, y: space.y), [.keyDown, .startHoldTimer(1)])
+        TestSupport.expectEqual(model.began(2, x: x.x, y: x.y), [.keyDown, .cancelHoldTimer(1), .type(.space)])
         TestSupport.expectEqual(model.ended(2, x: x.x, y: x.y), [.type(.character("x"))])
         TestSupport.expectEqual(model.ended(1, x: space.x, y: space.y), [.cancelHoldTimer(1)])
         // A committed space can no longer become the trackpad.
@@ -88,8 +88,8 @@ enum KeyTouchModelTests {
     private static func testReturnRolloverKeepsPressOrder() {
         var model = model()
         let returnKey = center(.returnKey), a = center(.character("a"))
-        TestSupport.expectEqual(model.began(1, x: returnKey.x, y: returnKey.y), [])
-        TestSupport.expectEqual(model.began(2, x: a.x, y: a.y), [.type(.returnKey)])
+        TestSupport.expectEqual(model.began(1, x: returnKey.x, y: returnKey.y), [.keyDown])
+        TestSupport.expectEqual(model.began(2, x: a.x, y: a.y), [.keyDown, .type(.returnKey)])
         TestSupport.expectEqual(model.ended(2, x: a.x, y: a.y), [.type(.character("a"))])
         TestSupport.expectEqual(model.ended(1, x: returnKey.x, y: returnKey.y), [])
     }
@@ -98,8 +98,8 @@ enum KeyTouchModelTests {
         var model = model()
         let h = center(.character("h")), i = center(.character("i")), space = center(.space)
         _ = model.began(1, x: h.x, y: h.y)
-        TestSupport.expectEqual(model.began(2, x: i.x, y: i.y), [.type(.character("h"))])
-        TestSupport.expectEqual(model.began(3, x: space.x, y: space.y), [.type(.character("i")), .startHoldTimer(3)])
+        TestSupport.expectEqual(model.began(2, x: i.x, y: i.y), [.keyDown, .type(.character("h"))])
+        TestSupport.expectEqual(model.began(3, x: space.x, y: space.y), [.keyDown, .type(.character("i")), .startHoldTimer(3)])
         // Lifts after a commit type nothing more; moves after it change nothing.
         TestSupport.expectEqual(model.moved(1, x: i.x, y: i.y), [])
         TestSupport.expectEqual(model.ended(1, x: i.x, y: i.y), [])
@@ -156,7 +156,7 @@ enum KeyTouchModelTests {
     private static func testSlideFromTheLayerKeyTypesAndReturns() {
         var model = model()
         let numbersKey = center(.layer(.numbers)), one = center(.character("1"), .numbers)
-        TestSupport.expectEqual(model.began(1, x: numbersKey.x, y: numbersKey.y), [.type(.layer(.numbers))])
+        TestSupport.expectEqual(model.began(1, x: numbersKey.x, y: numbersKey.y), [.keyDown, .type(.layer(.numbers))])
         _ = model.keysChanged(keys(.numbers), layer: .numbers)
         _ = model.moved(1, x: one.x, y: one.y)
         TestSupport.expectEqual(model.ended(1, x: one.x, y: one.y), [.type(.character("1")), .type(.layer(.letters))])
@@ -170,8 +170,8 @@ enum KeyTouchModelTests {
     private static func testDeleteSurvivesALayerChange() {
         var model = model()
         let delete = center(.delete), numbersKey = center(.layer(.numbers))
-        TestSupport.expectEqual(model.began(1, x: delete.x, y: delete.y), [.beginDelete])
-        TestSupport.expectEqual(model.began(2, x: numbersKey.x, y: numbersKey.y), [.type(.layer(.numbers))])
+        TestSupport.expectEqual(model.began(1, x: delete.x, y: delete.y), [.keyDown, .beginDelete])
+        TestSupport.expectEqual(model.began(2, x: numbersKey.x, y: numbersKey.y), [.keyDown, .type(.layer(.numbers))])
         TestSupport.expectEqual(model.keysChanged(keys(.numbers), layer: .numbers), [])
         TestSupport.expectEqual(model.ended(1, x: delete.x, y: delete.y), [.endDelete(cancelled: false)])
     }
@@ -179,7 +179,7 @@ enum KeyTouchModelTests {
     private static func testVanishedFunctionKeysAreDropped() {
         var model = model()
         let shift = center(.shift)
-        TestSupport.expectEqual(model.began(1, x: shift.x, y: shift.y), [.type(.shift)])
+        TestSupport.expectEqual(model.began(1, x: shift.x, y: shift.y), [.keyDown, .type(.shift)])
         // The numbers layer has no shift key: the finger is dropped without effect.
         TestSupport.expectEqual(model.keysChanged(keys(.numbers), layer: .numbers), [])
         TestSupport.expect(model.touches.isEmpty, "a finger on a vanished key")
@@ -207,7 +207,7 @@ enum KeyTouchModelTests {
         // release, and a release before the first deletion deletes once.
         var model = model()
         let delete = center(.delete)
-        TestSupport.expectEqual(model.began(1, x: delete.x, y: delete.y), [.beginDelete])
+        TestSupport.expectEqual(model.began(1, x: delete.x, y: delete.y), [.keyDown, .beginDelete])
         TestSupport.expectEqual(model.cancelled(1), [.endDelete(cancelled: true)])
         var released = self.model()
         _ = released.began(1, x: delete.x, y: delete.y)
@@ -239,13 +239,13 @@ extension KeyTouchModelTests {
         let a = center(.character("a")), s = center(.character("s"))
         let space = center(.space), enter = center(.returnKey)
         _ = model.began(1, x: a.x, y: a.y, field: fieldA)
-        TestSupport.expectEqual(model.began(2, x: s.x, y: s.y, field: fieldB), [.type(.character("a"), field: fieldA)])
+        TestSupport.expectEqual(model.began(2, x: s.x, y: s.y, field: fieldB), [.keyDown, .type(.character("a"), field: fieldA)])
         TestSupport.expectEqual(model.ended(2, x: s.x, y: s.y), [.type(.character("s"), field: fieldB)])
         TestSupport.expectEqual(model.ended(1, x: a.x, y: a.y), [])
         _ = model.began(3, x: space.x, y: space.y, field: fieldA)
         TestSupport.expectEqual(model.ended(3, x: space.x, y: space.y), [.cancelHoldTimer(3), .type(.space, field: fieldA)])
         _ = model.began(4, x: enter.x, y: enter.y, field: fieldA)
-        TestSupport.expectEqual(model.began(5, x: a.x, y: a.y, field: fieldB), [.type(.returnKey, field: fieldA)])
+        TestSupport.expectEqual(model.began(5, x: a.x, y: a.y, field: fieldB), [.keyDown, .type(.returnKey, field: fieldA)])
         TestSupport.expectEqual(model.ended(5, x: a.x, y: a.y), [.type(.character("a"), field: fieldB)])
     }
 

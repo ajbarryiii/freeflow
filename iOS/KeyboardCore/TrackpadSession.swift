@@ -144,6 +144,10 @@ struct TrackpadSession {
     /// The point's x is a real column: it was last placed on an anchored line.
     private var xIsReal = false
     private var snapshotContext: Context
+    /// The snapshot showed the caret inside a cluster (a key the accepted residual left there), and no move
+    /// or repair has been seen landing since: where the caret is, is not known.
+    private var startedInsideCluster = false
+    private var landingConfirmed = false
     /// The point is on a line the snapshot does not show.
     private var blocked: Edge?
     /// A position the caret must reach first (the snapshot's edge, walked to before a jump past it);
@@ -165,6 +169,9 @@ struct TrackpadSession {
     private var leftovers: [TimeInterval] = []
     /// Reports an earlier gesture in this field was still owed when this one began, by issue time.
     private var inherited: [TimeInterval] = []
+    /// Reports retired as overdue, by issue time (at most 16): a host may still send them, and none of
+    /// them is then the echo of a later edit (`lateReports`). Holds no text.
+    private var retiredReports: [TimeInterval] = []
     /// One of them arrived: the snapshot is taken again from the context it shows.
     private var resnapshotFromReport = false
     /// Whether the host reports each adjustment twice, first as issued (WebKit), or once (UIKit); nil
@@ -216,7 +223,8 @@ struct TrackpadSession {
         firstAnchoredLine = Self.firstAnchoredLine(navigator.text, lines: lines, startsLine: snapshotContext.startsLine)
         xIsReal = line >= firstAnchoredLine
         // Only a host that counts UTF-16 units leaves the caret inside a cluster.
-        if navigator.snapshotSplit != nil || Self.splitsSurrogatePair(snapshotContext) { self.unit = .utf16 }
+        startedInsideCluster = navigator.snapshotSplit != nil || Self.splitsSurrogatePair(snapshotContext)
+        if startedInsideCluster { self.unit = .utf16 }
         // The snapshot may be the proxy's provisional answer to that gesture's last adjustment: nothing
         // moves until its reports show the field as it is (or their time is up).
         inherited = owedReports
@@ -228,6 +236,18 @@ struct TrackpadSession {
     var owedReports: [TimeInterval] {
         guard !isCancelled else { return [] }
         return inherited + leftovers + pending.map(\.issuedAt)
+    }
+
+    /// Every report the host may still send for this gesture, by issue time, oldest first: as
+    /// `owedReports`, but both reports of an adjustment a host that reports twice (WebKit, or one not
+    /// known to report once) has not reported yet, a cancelled session's rollback and repairs, and
+    /// reports retired as overdue, which may still come. None of them is ever the echo of a later edit
+    /// (ARCHITECTURE.md, "Typing model v2").
+    var lateReports: [TimeInterval] {
+        let owed = isCancelled
+            ? lastIssuedAt.map { Array(repeating: $0, count: unconfirmedAdjustments) } ?? []
+            : inherited + leftovers + Self.reportTimes(pending, twice: reportsTwice != false)
+        return (retiredReports + owed).sorted()
     }
 
     /// Nothing is in flight, and the caret is at the target or can get no closer for now.
@@ -317,10 +337,15 @@ struct TrackpadSession {
     /// The text before the caret where the session leaves it (`committed`, where a move in flight lands),
     /// from the snapshot: what a key typed now reads while the proxy may still show an earlier caret. The
     /// proxy's window starts at a sentence or a line (measured in UIKit), so the snapshot's start reads as
-    /// one. Nil once cancelled, or with a probe or jump out, whose outcome a key abandons.
+    /// one. Nil once cancelled, or with a probe or jump out, whose outcome a key abandons, or when the gesture
+    /// began with the caret inside a cluster (a key the accepted residual left there) and no move or repair
+    /// has been seen landing since.
     var landingBefore: String? {
-        guard !isCancelled, flight.map({ Self.landsOnABoundary($0.kind) }) != false,
-              navigator.boundaries.indices.contains(committed) else { return nil }
+        guard !isCancelled, flight.map({ Self.landsOnABoundary($0.kind) }) != false else { return nil }
+        // From inside a cluster, nothing says where the host put the caret until a move or repair is seen
+        // landing.
+        if startedInsideCluster, !landingConfirmed { return nil }
+        guard navigator.boundaries.indices.contains(committed) else { return nil }
         let before = String(decoding: navigator.units[..<navigator.boundaries[committed]], as: UTF16.self)
         return (snapshotContext.droppedLineBreak ? "\n" : "") + before
     }
@@ -442,7 +467,9 @@ struct TrackpadSession {
         let split: (back: Int, forward: Int)? = Self.splitsSurrogatePair(context)
             ? (1, 1) : TextNavigator(before: context.before, after: context.after).snapshotSplit
         let hash = Self.contextHash(context)
-        if let split, watch.repairs < parameters.maximumRepairs, hash != watch.repairedIn {
+        // Only from a context that shows everything issued so far (the jump, a rollback, an earlier
+        // repair), as the guard does (`guardBoundary`).
+        if let split, watch.repairs < parameters.maximumRepairs, hash != watch.repairedIn, adjustmentsHeard(at: timestamp) {
             watch.repairs += 1
             watch.repairedIn = hash
             edgeWatch = watch
@@ -513,6 +540,7 @@ struct TrackpadSession {
                     || (fresh && current.acknowledged
                         && !navigator.canCompare(before: context.before, after: context.after, at: committed)) {
                     flight = nil
+                    landingConfirmed = true
                 } else if timedOut {
                     // The host did something else; trust what it reports.
                     flight = nil
@@ -524,6 +552,7 @@ struct TrackpadSession {
                 if let target, navigator.agrees(before: context.before, after: context.after, at: target) {
                     flight = nil
                     repairs = 0
+                    landingConfirmed = true
                 } else if (fresh && current.acknowledged) || timedOut {
                     flight = nil
                     adopt(context)
@@ -570,8 +599,10 @@ struct TrackpadSession {
     /// issued, though its outcome was a move elsewhere, leaves the caret unknown: ambiguous.
     private mutating func retireOverdue(at timestamp: TimeInterval) {
         let late = leftovers.prefix { timestamp - $0 > parameters.syncTimeout }.count
+        noteRetired(Array(leftovers.prefix(late)))
         leftovers.removeFirst(late)
         let lateInherited = inherited.prefix { timestamp - $0 > parameters.syncTimeout }.count
+        noteRetired(Array(inherited.prefix(lateInherited)))
         inherited.removeFirst(lateInherited)
         // The last of them will not come: the field as the proxy shows it now is all there is.
         if lateInherited > 0, inherited.isEmpty { resnapshotFromReport = true }
@@ -580,12 +611,25 @@ struct TrackpadSession {
         if overdue > 0 { retire(overdue) }
     }
 
+    private mutating func noteRetired(_ times: [TimeInterval]) {
+        retiredReports += times
+        if retiredReports.count > 16 { retiredReports.removeFirst(retiredReports.count - 16) }
+    }
+
+    /// The reports these adjustments may still send: two for one a host that reports twice has not
+    /// reported yet as issued.
+    private static func reportTimes<Entries: Sequence>(_ entries: Entries, twice: Bool) -> [TimeInterval]
+        where Entries.Element == Pending {
+        entries.flatMap { twice && !$0.reportedAsIssued ? [$0.issuedAt, $0.issuedAt] : [$0.issuedAt] }
+    }
+
     /// Retires the `count` oldest expectations.
     private mutating func retire(_ count: Int) {
         for entry in pending.prefix(count) where entry.reportedAsIssued && !Self.fits(entry.issuedIn, entry.outcomes) {
             isAmbiguous = true
         }
         if let suspended = suspendedFor, pending.prefix(count).contains(where: { $0.id == suspended }) { suspendedFor = nil }
+        noteRetired(Self.reportTimes(pending.prefix(count), twice: reportsTwice != false))
         pending.removeFirst(count)
         unconfirmedAdjustments = max(0, unconfirmedAdjustments - count)
     }

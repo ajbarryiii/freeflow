@@ -259,6 +259,10 @@ final class KeyboardInput: KeyAreaViewDelegate {
 
     // MARK: KeyAreaViewDelegate
 
+    func keyAreaTouchedDownKey(_ keyArea: KeyAreaView, timestamp: TimeInterval) {
+        editor.keyTouchedDown(now: now)
+    }
+
     func keyArea(_ keyArea: KeyAreaView, typed action: KeyAction, field: UUID?, timestamp: TimeInterval) {
         editor.press(action, field: field, at: timestamp, now: now)
     }

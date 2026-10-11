@@ -1490,3 +1490,49 @@ same duration and conditions, for example overnight.
   the model stays loaded. The power log shows this as a gap or a `terminate`
   row.
 - **Battery cost to the user:** this cost is the point of the test.
+
+### Keyboard round 10 notes (2026-10-10)
+
+- **Key-down ends settlement.** Every accepted key except the globe emits
+  `.keyDown` at touch-down. That covers Shift, layer keys, delete and Return,
+  and also presses without a touch (VoiceOver). It interrupts the trackpad
+  before anything else. Characters still insert at release.
+- **Late reports.** A finished or interrupted session keeps the reports it
+  still owes, for at most 1 s. They include double reports, rollbacks and
+  repairs, and reports retired as overdue. An edit counts as an echo only if
+  it predates the oldest owed report. While a gesture owes reports, a genuine
+  echo counts as an outside change. That only resets timing, and no measured
+  host echoes our edits.
+- **Unverified readings.** After a key abandons a probe, the typing tail
+  marks the proxy reading as unverified. A proxy showing what was typed
+  supersedes it, and deleting into it drops it. A reading recorded before
+  an edit never counts as showing that edit.
+- **Edge watch.** It repairs only from a landed context, and it outlives the
+  keyboard reappearing in the same field.
+- **Accepted residual, tested.** One delete after a key lands inside a
+  surrogate pair, or inside an emoji with a skin-tone modifier, restores
+  the cluster. The fake host stores UTF-16 units and shows a lone half as
+  U+FFFD, as the proxy does. Combining marks are not covered: UIKit's
+  `deleteBackward` there is unmeasured.
+- **Torture oracle.** Each edit is checked right after its release, and
+  every key is checked exactly, case included. After an interrupted free
+  gesture, only the first key's insertion point comes from the host. The
+  limits:
+  - Text before that point that no keyboard has seen is cased from the
+    proxy.
+  - Keys after free gestures are checked only on hosts that report within
+    `syncTimeout` and show edits immediately.
+  - The boundary check for gestures without a key is skipped on hosts
+    reporting after `syncTimeout`. Those hosts are outside the trackpad's
+    guarantees (round 8 residuals). The coordinator accepted this on
+    2026-10-10.
+
+  Seeds 1–12000 pass, and all 33 mutations are killed.
+- **Residual risks:**
+  - A jump past the window edge on a late-report host can stop inside a
+    hidden cluster.
+  - On hosts that show edits late, keys typed right after a key abandons a
+    probe can't see the text before the insertion point.
+  - The unit inference ("caret shown inside a cluster means UTF-16") can
+    mislearn on a grapheme host after the accepted residual.
+  - Device testing of `.keyDown` and v2 typing is pending.

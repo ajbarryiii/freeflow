@@ -11,6 +11,14 @@ enum KeyboardEditorTests {
         [
             ("keyRunsAtOnceAndEndsTheGesture", testKeyRunsAtOnceAndEndsTheGesture),
             ("lettersDuringAProbeRunAtOnceInOrder", testLettersDuringAProbeRunAtOnceInOrder),
+            ("anyKeyTouchDownEndsSettlement", testAnyKeyTouchDownEndsSettlement),
+            ("lateGestureReportIsNeverAnEcho", testLateGestureReportIsNeverAnEcho),
+            ("lateReportShowingAnEarlierEditsStateIsNoEcho", testLateReportShowingAnEarlierEditsStateIsNoEcho),
+            ("lateReportOfARetiredAdjustmentIsNoEcho", testLateReportOfARetiredAdjustmentIsNoEcho),
+            ("jumpWatchOutlastsHidingAndReappearing", testJumpWatchOutlastsHidingAndReappearing),
+            ("gestureFromInsideAClusterCasesFromTheField", testGestureFromInsideAClusterCasesFromTheField),
+            ("completedGestureLeavesNoCopyOfTheText", testCompletedGestureLeavesNoCopyOfTheText),
+            ("keyInsideAClusterIsUndoneByOneDelete", testKeyInsideAClusterIsUndoneByOneDelete),
             ("keysAfterReturnFollowTheFocus", testKeysAfterReturnFollowTheFocus),
             ("hidingLosesNothingTyped", testHidingLosesNothingTyped),
             ("dictationIsInsertedAtOnce", testDictationIsInsertedAtOnce),
@@ -86,6 +94,218 @@ enum KeyboardEditorTests {
             harness.settle()
             TestSupport.expectEqual(harness.document.host.adjustmentCount, adjustments)
             TestSupport.expectEqual(harness.document.text.replacingOccurrences(of: "aB", with: ""), "Hi \u{1F44D}\u{1F3FD}")
+        }
+    }
+
+    /// A gesture whose target lies past an emoji in a field whose unit is not known yet, with lagging
+    /// adjustments and reports: its first move is in flight at the lift, and it has more to do after it
+    /// (a probe across the emoji, then the rest).
+    private static func settlingGesture() -> KeyboardHarness {
+        let harness = KeyboardHarness(FakeTextHost(text: "ab\u{1F44D}cdef", unit: .utf16, lagFrames: 3, callbackFrames: 3))
+        harness.gesture(dx: -60, events: 1)
+        TestSupport.expect(harness.trackpad.isActive, "settled before the key")
+        return harness
+    }
+
+    private static func testAnyKeyTouchDownEndsSettlement() {
+        // The round-9 review's P1: Shift and layer keys never ended settlement, and a character only at its
+        // release, so a gesture report arriving after Shift moved the caret on before the letter. Any
+        // key's touch-down ends the gesture; nothing is adjusted after it, and the letter lands where the
+        // caret was once what was already issued landed.
+        let untouched = settlingGesture()
+        let issuedAtLift = untouched.document.host.adjustmentCount
+        untouched.settle()
+        TestSupport.expect(untouched.document.host.adjustmentCount > issuedAtLift, "the gesture had nothing left to do")
+        let cases: [(name: String, before: [KeyAction], letter: KeyAction, typed: String)] = [
+            ("shift", [.shift], .character("x"), "X"),
+            ("layer", [.layer(.numbers)], .character("1"), "1"),
+        ]
+        for testCase in cases {
+            let harness = settlingGesture()
+            for key in testCase.before { harness.tap(key) }
+            TestSupport.expect(!harness.trackpad.isActive, "\(testCase.name) did not end the gesture")
+            let adjustments = harness.document.host.adjustmentCount
+            // The gesture's reports arrive after the key.
+            harness.frames(12)
+            TestSupport.expectEqual(harness.document.host.adjustmentCount, adjustments)
+            let caret = harness.document.host.caret
+            harness.tap(testCase.letter)
+            harness.settle()
+            TestSupport.expectEqual(harness.document.host.adjustmentCount, adjustments)
+            var expected = Array("ab\u{1F44D}cdef".utf16)
+            expected.insert(contentsOf: Array(testCase.typed.utf16), at: caret)
+            TestSupport.expectEqual(harness.document.text, String(decoding: expected, as: UTF16.self))
+        }
+        // A character held across several frames of settlement: the gesture ends at its touch-down, and
+        // it inserts at its release where the caret was.
+        let held = settlingGesture()
+        let finger = held.touchDown(.character("q"))
+        TestSupport.expect(!held.trackpad.isActive, "a character's touch-down did not end the gesture")
+        let adjustments = held.document.host.adjustmentCount
+        held.frames(12)
+        TestSupport.expectEqual(held.document.text, "ab\u{1F44D}cdef")
+        let caret = held.document.host.caret
+        held.touchUp(finger)
+        held.settle()
+        TestSupport.expectEqual(held.document.host.adjustmentCount, adjustments)
+        var expected = Array("ab\u{1F44D}cdef".utf16)
+        expected.insert(contentsOf: Array("q".utf16), at: caret)
+        TestSupport.expectEqual(held.document.text, String(decoding: expected, as: UTF16.self))
+        // Shift and a layer key pressed without a touch (VoiceOver) end it too.
+        for key in [KeyAction.shift, .layer(.numbers)] {
+            let direct = settlingGesture()
+            direct.press(key)
+            TestSupport.expect(!direct.trackpad.isActive, "\(key) without a touch did not end the gesture")
+        }
+        // Delete and Return too.
+        for key in [KeyAction.delete, .returnKey] {
+            let harness = settlingGesture()
+            let finger = harness.touchDown(key)
+            TestSupport.expect(!harness.trackpad.isActive, "\(key) did not end the gesture at its touch-down")
+            harness.touchUp(finger)
+        }
+    }
+
+    private static func testLateGestureReportIsNeverAnEcho() {
+        // The round-9 review's P2: move to "One|Two", Space; the gesture's delayed report showed "One |Two",
+        // which is exactly what the space left, and was taken for its echo, so the second Space typed
+        // "One. Two". A report a gesture still owes is never an echo: it resets the timing.
+        let harness = KeyboardHarness(FakeTextHost(text: "OneTwo", unit: .utf16, callbackFrames: 6))
+        harness.gesture(dx: -30, events: 1)
+        TestSupport.expectEqual(harness.document.host.caret, 3)
+        harness.tap(.space)
+        let outcomes = harness.outcomes.count
+        harness.frames(10)
+        TestSupport.expectEqual(Array(harness.outcomes.dropFirst(outcomes)), [.outside])
+        harness.tap(.space)
+        TestSupport.expectEqual(harness.document.text, "One  Two")
+        // WebKit reports an adjustment twice; the second report, after more typing, is no echo either.
+        var webKit = FakeTextHost(text: "OneTwo", unit: .grapheme, callbackFrames: 6)
+        webKit.reportsAsIssuedFirst = true
+        let twice = KeyboardHarness(webKit)
+        twice.gesture(dx: -30, events: 1)
+        twice.tap(.space)
+        let before = twice.outcomes.count
+        for _ in 0 ..< 20 where twice.outcomes.count == before { twice.frame() }
+        twice.tap(.character("a"))
+        twice.tap(.space)
+        let afterFirst = twice.outcomes.count
+        for _ in 0 ..< 20 where twice.outcomes.count == afterFirst { twice.frame() }
+        TestSupport.expectEqual(Array(twice.outcomes.dropFirst(before)), [.outside, .outside])
+        twice.tap(.space)
+        TestSupport.expectEqual(twice.document.text, "One a  Two")
+        // Once the report has come, an edit made after it is echoed as before (a host that echoes, known
+        // from an earlier gesture to report each adjustment once; one not known yet may owe a second
+        // report, and until then a matching echo counts as an outside change).
+        let echoing = KeyboardHarness(FakeTextHost(text: "OneTwo", unit: .utf16, callbackFrames: 6), editCallbackDelay: 12)
+        echoing.gesture(dx: -10, events: 1)
+        echoing.settle()
+        echoing.gesture(dx: -20, events: 1)
+        echoing.tap(.space)
+        let start = echoing.outcomes.count
+        echoing.settle()
+        TestSupport.expectEqual(Array(echoing.outcomes.dropFirst(start)), [.outside, .ownEdit])
+    }
+
+    private static func testLateReportShowingAnEarlierEditsStateIsNoEcho() {
+        // Found by the typing torture (seed 315): "a", "l", a gesture out and back, then a delete, which
+        // brought the field back to exactly what "a" had left. The gesture's late reports showed that, and
+        // the first was taken for the echo of "a", made before the gesture. Once a gesture has finished,
+        // nothing is an echo until its reports have come.
+        let harness = KeyboardHarness(FakeTextHost(text: "One", unit: .utf16, callbackFrames: 20))
+        harness.type("al")
+        let finger = harness.beginGesture()
+        harness.drag(dx: -10, dy: 0)
+        harness.frames(2)
+        harness.drag(dx: 10, dy: 0)
+        harness.touchUp(finger)
+        TestSupport.expectEqual(harness.document.host.caret, 5)
+        harness.tap(.delete)
+        TestSupport.expectEqual(harness.document.text, "Onea")
+        let start = harness.outcomes.count
+        harness.settle()
+        let outcomes = Array(harness.outcomes.dropFirst(start))
+        TestSupport.expect(!outcomes.isEmpty && outcomes.allSatisfy { $0 == .outside }, "a late report taken as ours: \(outcomes)")
+    }
+
+    private static func testLateReportOfARetiredAdjustmentIsNoEcho() {
+        // A report later than `syncTimeout`: its expectation is retired and the gesture settles without it,
+        // but the host still sends it, showing exactly what the space typed meanwhile left. It is no echo.
+        let harness = KeyboardHarness(FakeTextHost(text: "OneTwo", unit: .utf16, callbackFrames: 45))
+        harness.gesture(dx: -30, events: 1)
+        harness.frames(40)
+        TestSupport.expect(!harness.trackpad.isActive, "the gesture waited past its time")
+        TestSupport.expectEqual(harness.document.host.caret, 3)
+        harness.tap(.space)
+        let start = harness.outcomes.count
+        harness.frames(10)
+        TestSupport.expectEqual(Array(harness.outcomes.dropFirst(start)), [.outside])
+        harness.tap(.space)
+        TestSupport.expectEqual(harness.document.text, "One  Two")
+    }
+
+    private static func testJumpWatchOutlastsHidingAndReappearing() {
+        // Found by the typing torture (seeds 6961, 9549): a jump past the window's edge stopped inside a
+        // hidden emoji, the keyboard hid, and it reappeared before the jump's report; the reappearance ended
+        // the watch, and the caret stayed inside the emoji. In the same field the text-free watch goes on.
+        var host = FakeTextHost(text: "ab\u{1F44D}\u{1F3FD}cd\nnext line", caret: 0, unit: .utf16, window: 2, callbackFrames: 30)
+        host.provisionalContext = true
+        let harness = KeyboardHarness(host)
+        let finger = harness.beginGesture()
+        var split = false
+        for _ in 0 ..< 30 where !split {
+            harness.drag(dx: 0, dy: 1)
+            split = !harness.document.host.caretIsOnBoundary
+        }
+        TestSupport.expect(split, "the jump never stopped inside the emoji")
+        harness.touchUp(finger)
+        harness.hide()
+        harness.frames(4)
+        harness.show()
+        harness.settle()
+        TestSupport.expect(harness.document.host.caretIsOnBoundary, "left inside the emoji at \(harness.document.host.caret)")
+        TestSupport.expectEqual(harness.document.text, "ab\u{1F44D}\u{1F3FD}cd\nnext line")
+    }
+
+    private static func testGestureFromInsideAClusterCasesFromTheField() {
+        // Found by the typing torture (seed 2083): a key the accepted residual left between "e" and its
+        // accent; a gesture began there and the host ignored its adjustments from inside the cluster, so the
+        // boundary the gesture assumed was not where the caret was. A key at the lift is cased from the
+        // field's own text before the caret, not from that assumed landing.
+        let harness = KeyboardHarness(FakeTextHost(text: "Done. e\u{301}", caret: 7, unit: .grapheme, callbackFrames: 3),
+                                      autocapitalization: .sentences)
+        harness.gesture(dx: -10, events: 1)
+        TestSupport.expect(harness.trackpad.isActive, "settled before the key")
+        harness.tap(.character("x"))
+        harness.settle()
+        TestSupport.expectEqual(harness.document.host.units, Array("Done. ex\u{301}".utf16))
+    }
+
+    private static func testCompletedGestureLeavesNoCopyOfTheText() {
+        // Only a key that ends a gesture needs its landing, which the proxy may not show yet. A gesture that
+        // settles on its own has been heard from: the typing tail keeps no copy of the field's text.
+        let harness = KeyboardHarness(FakeTextHost(text: "Alpha beta gamma", unit: .utf16, callbackFrames: 2))
+        harness.gesture(dx: -30, events: 1)
+        harness.settle()
+        TestSupport.expectEqual(harness.document.host.caret, 13)
+        TestSupport.expectEqual(harness.editor.tail.known, nil)
+    }
+
+    private static func testKeyInsideAClusterIsUndoneByOneDelete() {
+        // ARCHITECTURE.md, "Typing model v2", accepted residual: a key typed as a probe crosses a cluster
+        // may land inside it (placed there directly here). It is visible, and one delete restores the
+        // cluster exactly: the host keeps the halves of a split surrogate pair, as UIKit's storage does.
+        for (text, caret) in [("Hi \u{1F44D} there", 4), ("Hi \u{1F44D}\u{1F3FD} there", 5)] {
+            let harness = KeyboardHarness(FakeTextHost(text: text, caret: caret, unit: .utf16))
+            let original = harness.document.host.units
+            harness.tap(.character("x"))
+            var inside = original
+            inside.insert(contentsOf: Array("x".utf16), at: caret)
+            TestSupport.expectEqual(harness.document.host.units, inside)
+            harness.tap(.delete)
+            harness.settle()
+            TestSupport.expectEqual(harness.document.host.units, original)
+            TestSupport.expectEqual(harness.document.host.caret, caret)
         }
     }
 
@@ -469,8 +689,10 @@ enum KeyboardEditorTests {
     /// Seeds 1...60 and earlier failures by default; `TORTURE_SEEDS=first-last` runs others (a stress run
     /// on the Mac). Prints the failing seed and the smallest failing number of steps.
     private static func testTypingTorture() {
-        // Seeds a stress run found failing in round 9, each a bug since fixed.
-        var seeds = Array(UInt64(1) ... 60) + [419, 439, 469, 6990, 11942]
+        // Seeds a stress run found failing in rounds 9 and 10, each a bug since fixed or a limit the oracle
+        // now states.
+        var seeds = Array(UInt64(1) ... 60) + [63, 107, 114, 156, 315, 419, 439, 469, 556, 1240, 1284, 1402, 1850, 2083, 2105,
+                                              4026, 5329, 6822, 6961, 6990, 9549, 11942]
         if let range = ProcessInfo.processInfo.environment["TORTURE_SEEDS"]?.split(separator: "-"), range.count == 2,
            let first = UInt64(range[0]), let last = UInt64(range[1]), first <= last {
             seeds = Array(first ... last)
@@ -581,7 +803,12 @@ final class KeyboardHarness {
         for _ in 0 ..< maxFrames where !isQuiet { frame() }
     }
 
+    /// Called before every host callback reaches the editor, with whether a gesture is running (the typing
+    /// torture's oracle).
+    var onDeliver: ((Bool) -> Void)?
+
     private func deliver(textChanged: Bool) -> EditingCore.CallbackOutcome {
+        onDeliver?(trackpad.isActive)
         let outcome = editor.hostChanged(textChanged: textChanged, now: time)
         outcomes.append(outcome)
         return outcome
@@ -652,6 +879,8 @@ final class KeyboardHarness {
     private func perform(_ effects: [KeyTouchModel.Effect]) {
         for effect in effects {
             switch effect {
+            case .keyDown:
+                editor.keyTouchedDown(now: time)
             case .type(let action, let field):
                 editor.press(action, field: field, at: time, now: time)
             case .beginDelete:

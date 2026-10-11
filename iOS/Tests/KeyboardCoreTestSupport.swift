@@ -69,7 +69,14 @@ enum FakeContextModel {
 /// land a few frames late. `insertText` and `deleteBackward` change the text at once and send no
 /// callback; an adjustment sends `textDidChange` after it lands.
 struct FakeTextHost {
-    var text: String
+    /// The document as UTF-16 code units, as UIKit's NSString storage keeps it: a key inserted between the
+    /// halves of a surrogate pair leaves both halves intact, and deleting it rejoins them.
+    private(set) var units: [UInt16]
+    /// The document as a Swift string: a lone surrogate half reads as U+FFFD (one unit, so offsets agree).
+    var text: String {
+        get { String(decoding: units, as: UTF16.self) }
+        set { units = Array(newValue.utf16) }
+    }
     /// The caret as a UTF-16 offset.
     private(set) var caret: Int
     var unit: CursorOffsetUnit
@@ -97,7 +104,7 @@ struct FakeTextHost {
 
     init(text: String, caret: Int? = nil, unit: CursorOffsetUnit = .utf16, model: FakeContextModel = .whole,
          window: Int? = nil, lagFrames: Int = 0, callbackFrames: Int? = 1, provisionalContext: Bool = false) {
-        self.text = text
+        units = Array(text.utf16)
         self.caret = caret ?? text.utf16.count
         self.unit = unit
         self.model = model
@@ -170,6 +177,14 @@ struct FakeTextHost {
     /// Adjustments or callbacks are still to come.
     var hasCallbacksToCome: Bool { !queued.isEmpty || !callbacks.isEmpty }
 
+    /// Where the caret will be once the adjustments still lagging have landed (where the next edit acts),
+    /// without letting them land.
+    var caretOnceAdjusted: Int {
+        var landed = self
+        landed.applyQueuedAdjustments()
+        return landed.caret
+    }
+
     /// Adjustments still lagging land first: the host applies the proxy's operations in order.
     mutating func applyQueuedAdjustments() {
         while !queued.isEmpty { apply(queued.removeFirst().offset) }
@@ -181,9 +196,7 @@ struct FakeTextHost {
         edited()
         provisional = nil
         forgetShownCarets()
-        let units = Array(text.utf16)
-        text = String(decoding: units[..<caret], as: UTF16.self) + inserted
-            + String(decoding: units[(caret + selectionLength)...], as: UTF16.self)
+        units.replaceSubrange(caret ..< caret + selectionLength, with: Array(inserted.utf16))
         caret += inserted.utf16.count
         selectionLength = 0
     }
@@ -196,17 +209,14 @@ struct FakeTextHost {
         provisional = nil
         forgetShownCarets()
         if selectionLength > 0 {
-            let units = Array(text.utf16)
-            text = String(decoding: units[..<caret], as: UTF16.self)
-                + String(decoding: units[(caret + selectionLength)...], as: UTF16.self)
+            units.removeSubrange(caret ..< caret + selectionLength)
             selectionLength = 0
             return
         }
         guard caret > 0 else { return }
         let offsets = graphemeOffsets()
         let start = offsets.last { $0 < caret } ?? 0
-        let units = Array(text.utf16)
-        text = String(decoding: units[..<start], as: UTF16.self) + String(decoding: units[caret...], as: UTF16.self)
+        units.removeSubrange(start ..< caret)
         caret = start
     }
 
@@ -248,6 +258,8 @@ struct FakeTextHost {
         }
     }
 
+    /// Character boundaries in `units`. The lossy `text` has the same offsets: each lone surrogate half
+    /// is one U+FFFD, one unit long, and its own character.
     private func graphemeOffsets() -> [Int] {
         var offsets = [0], offset = 0
         for character in text {
@@ -310,8 +322,7 @@ struct FakeTextHost {
 
     /// The host app inserts text at a UTF-16 offset (a boundary, outside any selection).
     mutating func hostInsert(_ inserted: String, at offset: Int) {
-        let units = Array(text.utf16)
-        text = String(decoding: units[..<offset], as: UTF16.self) + inserted + String(decoding: units[offset...], as: UTF16.self)
+        units.insert(contentsOf: Array(inserted.utf16), at: offset)
         if offset <= caret { caret += inserted.utf16.count }
         provisional = nil
         staleContext = nil
@@ -320,8 +331,7 @@ struct FakeTextHost {
 
     /// The host app deletes a range of UTF-16 offsets (on boundaries); a selection is dropped.
     mutating func hostDelete(_ range: Range<Int>) {
-        let units = Array(text.utf16)
-        text = String(decoding: units[..<range.lowerBound], as: UTF16.self) + String(decoding: units[range.upperBound...], as: UTF16.self)
+        units.removeSubrange(range)
         if caret >= range.upperBound {
             caret -= range.count
         } else if caret > range.lowerBound {
@@ -334,7 +344,6 @@ struct FakeTextHost {
     }
 
     private func window(at caret: Int) -> (before: String, after: String) {
-        let units = Array(text.utf16)
         var start = 0, end = units.count
         switch model {
         case .whole:
@@ -357,7 +366,7 @@ struct FakeTextHost {
             start = max(start, before[max(before.count - 1 - window, 0)])
             end = min(end, after[min(window, after.count - 1)])
         }
-        // A caret inside a cluster splits it, as UIKit does.
+        // A caret inside a cluster splits it, as UIKit does; the proxy bridges a lone surrogate half as U+FFFD.
         let beforeText = String(decoding: units[min(start, caret) ..< caret], as: UTF16.self)
         let afterText = String(decoding: units[caret ..< max(end, caret)], as: UTF16.self)
         return (beforeText, afterText)
@@ -368,7 +377,6 @@ struct FakeTextHost {
 
     /// Whether the caret sits between the two halves of a surrogate pair.
     var caretSplitsSurrogatePair: Bool {
-        let units = Array(text.utf16)
         guard caret > 0, caret < units.count else { return false }
         return UTF16.isLeadSurrogate(units[caret - 1]) && UTF16.isTrailSurrogate(units[caret])
     }
