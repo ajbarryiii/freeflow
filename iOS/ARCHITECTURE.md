@@ -1278,8 +1278,10 @@ binaries or bundles. A production build therefore cannot reuse an
 instrumented product, whatever the make version, flags or timing. This
 replaces any configuration-stamp or parse-time invalidation for
 `POWER_LOG` (decided after three review rounds on that mechanism). Output
-paths are compared after normalization (`abspath`), and a `POWER_LOG=0`
-build into any directory ending in `-power` is refused. The general
+paths stay relative in the dependency graph, as before. Normalization
+(`abspath`) is used only for the refusal check: a `POWER_LOG=0` build into
+any directory whose normalized path ends in `-power` is refused. `clean`
+quotes each directory as one whole path. The general
 configuration stamp's one-run-late behavior under make 3.81 for other
 variables predates the power log and is out of scope. The pure
 core in HostCore is compiled and tested in every `make check`, but nothing
@@ -1434,7 +1436,11 @@ the power log alone cannot observe this.
   still cancelled at lock exactly as today: intents and results are class A
   and unavailable while locked. The session, the audio session and the
   engine keep running. Buffers are dropped in the tap, as between dictations.
-- **Locked means no dictation.** The lock notification latches a locked
+- **Locked means no dictation.** This applies only while always-on is on.
+  With always-on off (the default, and every production build), behavior
+  is exactly as before the mode existed: lock ends the session and no
+  session starts in the background, so nothing can be admitted while
+  locked. While always-on is on, the lock notification latches a locked
   state until `protectedDataDidBecomeAvailable`. While locked, no intent is
   admitted and no pending capture or dictation starts, even if the intent
   file is still readable: iOS posts the notification before files become
@@ -1442,9 +1448,12 @@ the power log alone cannot observe this.
   later. An intent the host could not read while locked gets only the normal
   freshness check after unlock; there is no "issued before unlock" rule,
   because the keyboard writes an intent before the host comes forward.
-  The latch clears on `protectedDataDidBecomeAvailable`, and also whenever
-  the app becomes active or enters the foreground with protected data
-  available, because a suspended app can miss the unlock notification. It
+  The latch clears on `protectedDataDidBecomeAvailable`, and also on the
+  `willEnterForeground` and `didBecomeActive` events themselves (not a
+  derived foreground state, which can still read background during
+  `willEnterForeground`) when protected data is available, before any
+  admission runs, because a suspended app can miss the unlock notification.
+  Turning always-on off clears the latch. It
   is never cleared by polling during the will-become-unavailable window,
   where UIKit still reports data as available (added after the always-on
   review).
