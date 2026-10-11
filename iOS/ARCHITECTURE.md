@@ -1271,8 +1271,13 @@ complement each other.
 
 **Build gate.** `make -C iOS POWER_LOG=1` adds `-D LOCALFLOW_POWER_LOG` to the
 host app only. Without it (the default, and every production build) the app
-contains no recorder, writes no power file and shows no Power section. A
-`POWER_LOG` change must invalidate the build (configuration stamp). The pure
+contains no recorder, writes no power file and shows no Power section.
+`POWER_LOG=1` builds write every product to a separate output directory
+(`$(BUILD_DIR)-power`), so the two configurations never share objects,
+binaries or bundles. A production build therefore cannot reuse an
+instrumented product, whatever the make version, flags or timing. This
+replaces any configuration-stamp or parse-time invalidation for
+`POWER_LOG` (decided after three review rounds on that mechanism). The pure
 core in HostCore is compiled and tested in every `make check`, but nothing
 outside the gate calls it. Device test builds published to the OTA page set
 `POWER_LOG=1`. The keyboard extension is never instrumented.
