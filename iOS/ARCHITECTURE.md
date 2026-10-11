@@ -1220,13 +1220,23 @@ waits and deadlines. Each fix added more of it.
 - **Execution:** a key executes immediately when it is released, through
   the proxy, as on every other iOS keyboard. Keys are never queued, delayed
   or batched. The proxy serializes edits in the order they are issued.
-- **Trackpad interaction:** a key press ends any trackpad settlement or
-  verification on the spot. No further adjustments are issued for that
-  gesture, and any probe outcome is abandoned.
+  **Rollover** (clarified after the round-9 review): when another key
+  touches down while a character key is still held, the held key commits
+  first, in press order, as on Apple's keyboard. "Release order" means this
+  commit order.
+- **Trackpad interaction:** the touch-down of any key ends any trackpad
+  settlement or verification on the spot. That includes Shift, layer keys,
+  delete and Return, not only character keys. No further adjustments are
+  issued for that gesture, and any probe outcome is abandoned. A held
+  character still inserts at its release.
+- **Late gesture reports are never echoes.** A host report that an
+  interrupted or finished gesture still owes is never taken as the echo of
+  a later insertion, even if the text matches.
 - **Accepted residual:** if a key is typed in the same instant a probe is
   crossing a multi-code-unit cluster, the key may land inside that cluster.
-  It is visible and one delete fixes it. This replaces the old guarantee that
-  typing is never released inside a cluster.
+  It is visible, and one delete fixes it (tested: deleting the inserted
+  character restores the original cluster). This replaces the old guarantee
+  that typing is never released inside a cluster.
 - **Field binding:** a key goes to the field current at release. If both
   the press-time and release-time field identities are known and differ, the
   key is cancelled. A nil identity on either side does not block the key.
@@ -1245,7 +1255,10 @@ waits and deadlines. Each fix added more of it.
 **Torture-test contract:** the document equals the keys applied in release
 order at the caret positions implied by the script, with an independent
 oracle. Cluster-boundary assertions apply only to gestures that no key
-interrupted.
+interrupted. Each edit is asserted right after its release, not only once
+the host is quiet. For an interrupted gesture, only the first key's
+position may be taken from the host's observable insertion point. Every
+later key is checked exactly, case included, relative to it.
 
 ## Power log (test builds only; user decision 2026-10-10)
 
