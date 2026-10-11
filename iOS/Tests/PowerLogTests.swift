@@ -17,27 +17,32 @@ enum PowerLogTests {
             ("filesWithAnotherHeaderAreRotated", testFilesWithAnotherHeaderAreRotated),
             ("filesAreExcludedFromBackupAndClear", testFilesAreExcludedFromBackupAndClear),
             ("hostStateFromStatus", testHostStateFromStatus),
+            ("readsSchema1Files", testReadsSchema1Files),
         ]
     }
 
     static let expectedColumns = [
         "wall_time", "uptime_s", "trigger", "host_state", "app_state", "battery_level", "battery_state",
         "low_power_mode", "thermal_state", "cpu_user_s", "cpu_system_s", "memory_mb", "memory_peak_mb",
-        "compute_units", "build", "device",
+        "compute_units", "build", "device", "always_on", "protected_data",
     ]
+
+    /// Schema 1, before the always-on mode: still read.
+    static let schema1Header = "wall_time,uptime_s,trigger,host_state,app_state,battery_level,battery_state,low_power_mode,thermal_state,cpu_user_s,cpu_system_s,memory_mb,memory_peak_mb,compute_units,build,device"
 
     private static func testHeaderAndSchemaLine() {
         TestSupport.expectEqual(PowerLogCSV.columns, expectedColumns)
-        TestSupport.expectEqual(PowerLogCSV.schema, 1)
+        TestSupport.expectEqual(PowerLogCSV.schema, 2)
         TestSupport.expectEqual(PowerLogCSV.header, expectedColumns.joined(separator: ","))
-        TestSupport.expectEqual(PowerLogCSV.schemaLine, "# schema=1")
-        TestSupport.expectEqual(PowerLogCSV.preamble, expectedColumns.joined(separator: ",") + "\n# schema=1\n")
+        TestSupport.expectEqual(PowerLogCSV.schemaLine, "# schema=2")
+        TestSupport.expectEqual(PowerLogCSV.preamble, expectedColumns.joined(separator: ",") + "\n# schema=2\n")
     }
 
     private static func testEnumSpellings() {
         TestSupport.expectEqual(PowerTrigger.allCases.map(\.rawValue),
                                 ["periodic", "state", "battery", "thermal", "powerMode", "launch", "foreground",
-                                 "background", "terminate"])
+                                 "background", "terminate", "protectedData"])
+        TestSupport.expectEqual(PowerProtectedData.allCases.map(\.rawValue), ["available", "unavailable"])
         TestSupport.expectEqual(PowerHostState.allCases.map(\.rawValue),
                                 ["idle", "micOpen", "recording", "transcribing", "preparing"])
         TestSupport.expectEqual(PowerAppState.allCases.map(\.rawValue), ["foreground", "background"])
@@ -51,10 +56,11 @@ enum PowerLogTests {
             wallTime: Date(timeIntervalSince1970: 1_800_000_000.25), uptime: 12_345.678, trigger: .state,
             hostState: .micOpen, appState: .background, batteryLevel: 0.85, batteryState: .unplugged,
             lowPowerMode: false, thermalState: .fair, cpuUserSeconds: 12.5, cpuSystemSeconds: 3.25,
-            memoryMB: 165.43, memoryPeakMB: 170, computeUnits: .cpuAndNeuralEngine, build: "42", device: "iPhone16,1")
+            memoryMB: 165.43, memoryPeakMB: 170, computeUnits: .cpuAndNeuralEngine, build: "42", device: "iPhone16,1",
+            alwaysOn: true, protectedData: .unavailable)
         TestSupport.expectEqual(
             PowerLogCSV.line(sample),
-            "2027-01-15T08:00:00.250Z,12345.678,state,micOpen,background,0.850,unplugged,false,fair,12.500,3.250,165.4,170.0,cpuAndNeuralEngine,42,\"iPhone16,1\"")
+            "2027-01-15T08:00:00.250Z,12345.678,state,micOpen,background,0.850,unplugged,false,fair,12.500,3.250,165.4,170.0,cpuAndNeuralEngine,42,\"iPhone16,1\",true,unavailable")
 
         var unknown = sample
         unknown.batteryLevel = -1
@@ -64,9 +70,11 @@ enum PowerLogTests {
         unknown.memoryPeakMB = nil
         unknown.computeUnits = nil
         unknown.device = "arm64"
+        unknown.alwaysOn = false
+        unknown.protectedData = nil
         TestSupport.expectEqual(
             PowerLogCSV.line(unknown),
-            "2027-01-15T08:00:00.250Z,12345.678,state,micOpen,background,-1,unknown,true,fair,12.500,3.250,,,,42,arm64")
+            "2027-01-15T08:00:00.250Z,12345.678,state,micOpen,background,-1,unknown,true,fair,12.500,3.250,,,,42,arm64,false,")
     }
 
     private static func testRoundTrips() {
@@ -74,7 +82,9 @@ enum PowerLogTests {
             PowerSynthetic.sample(0, .launch),
             PowerSynthetic.sample(60, .state, host: .recording, level: -1, battery: .unknown, cpu: 1.5),
             PowerSynthetic.sample(61.5, .terminate, host: .transcribing, app: .background, level: 0.42,
-                                  battery: .charging, cpu: 2.5, lowPower: true, thermal: .critical, units: .cpuOnly),
+                                  battery: .charging, cpu: 2.5, lowPower: true, thermal: .critical, units: .cpuOnly,
+                                  alwaysOn: true, protected: .unavailable),
+            PowerSynthetic.sample(70, .protectedData, host: .micOpen, app: .background, alwaysOn: true, protected: nil),
         ]
         for sample in samples {
             TestSupport.expectEqual(PowerLogCSV.sample(fromLine: PowerLogCSV.line(sample)), sample)
@@ -204,11 +214,11 @@ enum PowerLogTests {
             let excluded = try? url.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup
             TestSupport.expect(excluded == true, "\(url.lastPathComponent) is excluded from backup")
         }
-        try! files.clear()
+        TestSupport.expectEqual(files.clear(), .cleared)
         TestSupport.expectEqual(files.existingFiles, [])
         TestSupport.expectEqual(files.totalBytes, 0)
         TestSupport.expectEqual(files.readSamples(), [])
-        try! files.clear()   // clearing nothing is fine
+        TestSupport.expectEqual(files.clear(), .cleared)   // clearing nothing is fine
         try! files.append([PowerSynthetic.sample(9)])
         TestSupport.expectEqual(files.readSamples(), [PowerSynthetic.sample(9)])
     }
@@ -239,6 +249,36 @@ enum PowerLogTests {
     }
 }
 
+
+extension PowerLogTests {
+    /// Files written before schema 2 (no always_on or protected_data) still read: the mode was off, and
+    /// protected data was not recorded. Appending to such a file rotates it, and both files read.
+    fileprivate static func testReadsSchema1Files() {
+        let line = "2027-01-15T08:00:00.250Z,12345.678,state,micOpen,background,0.850,unplugged,false,fair,12.500,3.250,165.4,170.0,cpuAndNeuralEngine,42,\"iPhone16,1\""
+        let text = schema1Header + "\n# schema=1\n" + line + "\n"
+        let expected = PowerSample(
+            wallTime: Date(timeIntervalSince1970: 1_800_000_000.25), uptime: 12_345.678, trigger: .state,
+            hostState: .micOpen, appState: .background, batteryLevel: 0.85, batteryState: .unplugged,
+            lowPowerMode: false, thermalState: .fair, cpuUserSeconds: 12.5, cpuSystemSeconds: 3.25,
+            memoryMB: 165.4, memoryPeakMB: 170, computeUnits: .cpuAndNeuralEngine, build: "42", device: "iPhone16,1",
+            alwaysOn: false, protectedData: nil)
+        TestSupport.expectEqual(PowerLogCSV.parse(text), [expected])
+        // A schema 2 row under a schema 1 header (or the reverse) does not parse.
+        let two = PowerLogCSV.line(PowerSynthetic.sample(1))
+        TestSupport.expectEqual(PowerLogCSV.parse(schema1Header + "\n# schema=1\n" + two + "\n"), [])
+        TestSupport.expectEqual(PowerLogCSV.parse(PowerLogCSV.preamble + line + "\n"), [])
+
+        let directory = TestSupport.makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let files = PowerLogFiles(directory: directory, fileName: "log.csv", rotatedFileName: "log.1.csv")
+        try! text.write(to: files.currentURL, atomically: true, encoding: .utf8)
+        let next = PowerSynthetic.sample(60, alwaysOn: true)
+        try! files.append([next])
+        TestSupport.expectEqual(files.existingFiles, [files.rotatedURL, files.currentURL])
+        TestSupport.expectEqual(files.readSamples(), [expected, next])
+    }
+}
+
 /// Invented samples. `t` is seconds since the start of a synthetic process run; wall time follows it
 /// unless given. CPU is split 3:1 between user and system.
 enum PowerSynthetic {
@@ -249,10 +289,12 @@ enum PowerSynthetic {
                        app: PowerAppState = .foreground, level: Double = 0.8, battery: PowerBatteryState = .unplugged,
                        cpu: Double = 0, wall: TimeInterval? = nil, uptime: TimeInterval? = nil,
                        lowPower: Bool = false, thermal: PowerThermalState = .nominal,
-                       units: ComputePolicy.Units? = nil) -> PowerSample {
+                       units: ComputePolicy.Units? = nil, alwaysOn: Bool = false,
+                       protected: PowerProtectedData? = .available) -> PowerSample {
         PowerSample(wallTime: wallBase.addingTimeInterval(wall ?? t), uptime: uptime ?? uptimeBase + t, trigger: trigger,
                     hostState: host, appState: app, batteryLevel: level, batteryState: battery, lowPowerMode: lowPower,
                     thermalState: thermal, cpuUserSeconds: cpu * 0.75, cpuSystemSeconds: cpu * 0.25,
-                    memoryMB: 120.5, memoryPeakMB: 166.0, computeUnits: units, build: "1", device: "iPhone16,1")
+                    memoryMB: 120.5, memoryPeakMB: 166.0, computeUnits: units, build: "1", device: "iPhone16,1",
+                    alwaysOn: alwaysOn, protectedData: protected)
     }
 }

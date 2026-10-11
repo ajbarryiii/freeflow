@@ -25,6 +25,10 @@ final class HostSessionController: ObservableObject {
     @Published var bounceVisible = false
     /// "Try it" has the keyboard in this app, so an admission there must not cover it.
     var tryItVisible = false
+    #if LOCALFLOW_POWER_LOG
+    /// The always-on microphone test mode (power test builds only), mirrored for Diagnostics and Home.
+    @Published private(set) var alwaysOnMicrophone = false
+    #endif
 
     let configuration: LocalFlowConfiguration?
     let preferences = AppPreferences()
@@ -84,6 +88,8 @@ final class HostSessionController: ObservableObject {
         #if LOCALFLOW_POWER_LOG
         // Test builds only: a passive observer of every published status (ARCHITECTURE.md, "Power log").
         core.onPublish = { PowerRecorder.shared.hostStatusPublished($0) }
+        alwaysOnMicrophone = AlwaysOnPreference.isOn
+        core.setAlwaysOn(alwaysOnMicrophone)   // before launch: recorded, not published
         #endif
     }
 
@@ -93,7 +99,8 @@ final class HostSessionController: ObservableObject {
         guard let core, !core.isLaunched else { return }
         #if LOCALFLOW_POWER_LOG
         let transcriber = self.transcriber
-        PowerRecorder.shared.start { transcriber.activeUnits }
+        PowerRecorder.shared.start(computeUnits: { transcriber.activeUnits },
+                                   alwaysOn: { [weak core] in core?.alwaysOn ?? false })
         #endif
         core.launch()
         let timer = Timer(timeInterval: HostSessionPolicy.tickInterval, repeats: true) { [weak self] _ in
@@ -109,6 +116,16 @@ final class HostSessionController: ObservableObject {
     }
 
     var isConfigured: Bool { core != nil }
+
+    #if LOCALFLOW_POWER_LOG
+    /// Diagnostics → Power and the Home banner: stored in the app's own defaults, applied at once.
+    func setAlwaysOnMicrophone(_ on: Bool) {
+        AlwaysOnPreference.isOn = on
+        alwaysOnMicrophone = on
+        core?.setAlwaysOn(on)
+        PowerRecorder.shared.alwaysOnChanged()
+    }
+    #endif
 
     // MARK: User actions
 

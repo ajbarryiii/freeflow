@@ -43,6 +43,10 @@ final class HostSessionCore {
     private(set) var idleSince: Date?
     private(set) var lastForegroundAt: Date?
     private(set) var hasBeenForeground = false
+    /// The always-on microphone test mode (ARCHITECTURE.md; power test builds only, where gated code sets
+    /// it with `setAlwaysOn`). While on: no idle expiry, and a lock cancels an in-progress dictation but
+    /// keeps the session, the audio session and the engine. Off by default.
+    private(set) var alwaysOn = false
 
     private var sessionGeneration: UInt64 = 0
     /// A session start waiting for the foreground (the permission prompt was answered elsewhere).
@@ -96,8 +100,11 @@ final class HostSessionCore {
     var isDictationInProgress: Bool { slot.isInProgress }
     var level: Float { slot.phase == .recording ? buffer.level : 0 }
     var sessionExpiresAt: Date? {
-        HostSessionPolicy.sessionExpiresAt(session: session, idleSince: idleSince, duration: settings.sessionDuration)
+        HostSessionPolicy.sessionExpiresAt(session: session, idleSince: expiryIdleSince, duration: settings.sessionDuration)
     }
+
+    /// Idle expiry's reference point; there is none while always-on.
+    private var expiryIdleSince: Date? { alwaysOn ? nil : idleSince }
 
     // MARK: Inputs
 
@@ -145,7 +152,7 @@ final class HostSessionCore {
         }
         if pendingStart != nil, !slot.isInProgress { endSession(.startFailed(.audioSessionFailed), now) }
         if session == .active, !slot.isInProgress,
-           HostSessionPolicy.isIdleExpired(idleSince: idleSince, duration: settings.sessionDuration, now: now) {
+           HostSessionPolicy.isIdleExpired(idleSince: expiryIdleSince, duration: settings.sessionDuration, now: now) {
             endSession(.idleExpired, now)
         }
         releaseModelIfPending()
@@ -176,6 +183,19 @@ final class HostSessionCore {
             if session == .active, capture.needsReconfiguration { reconfigureCapture(now) }
             reconcilePass(.activation, now)
         }
+        needsPublish = true
+        flush(now)
+    }
+
+    /// Turns the always-on test mode on or off, at once. Turning it off starts idle expiry from now (or from
+    /// the end of a dictation in progress), and the next lock ends the session. It never starts a session.
+    /// Before `launch` it only records the choice: run recovery must read the previous run's status first.
+    func setAlwaysOn(_ on: Bool) {
+        guard on != alwaysOn else { return }
+        alwaysOn = on
+        guard isLaunched else { return }
+        let now = environment.now()
+        if !on, session == .active, !slot.isInProgress { idleSince = now }
         needsPublish = true
         flush(now)
     }
@@ -213,14 +233,16 @@ final class HostSessionCore {
     }
 
     /// `protectedDataWillBecomeUnavailable`: cancels everything in flight, including a transcription
-    /// that outlived its session, and ends the session.
+    /// that outlived its session, and ends the session unless the always-on test mode is on.
     func deviceWillLock() {
         let now = environment.now()
         if let phase = slot.phase, slot.isInProgress,
            let outcome = HostSessionPolicy.sessionEndOutcome(.deviceLocked, phase: phase) {
             endInProgress(outcome, now)
         }
-        endSession(.deviceLocked, now)
+        // Always-on keeps the session: intents and results are class A and unreadable while locked, so the
+        // dictation is cancelled above exactly as before, but capture goes on with buffers dropped.
+        if !alwaysOn { endSession(.deviceLocked, now) }
         flush(now)
     }
 
@@ -657,7 +679,7 @@ final class HostSessionCore {
         needsPublish = false
         let status = HostSessionPolicy.status(
             hostRunID: hostRunID, sessionID: sessionID, session: session, captureRunning: capture.isRunning,
-            lastBufferAt: capture.lastBufferAt, idleSince: idleSince, sessionDuration: settings.sessionDuration,
+            lastBufferAt: capture.lastBufferAt, idleSince: expiryIdleSince, sessionDuration: settings.sessionDuration,
             model: transcriber.modelState, dictation: slot.current, level: buffer.level, error: sessionError, now: now)
         lastStatusAt = now
         // A failed write is retried by the next heartbeat; the reader treats a stale one as a dead host.

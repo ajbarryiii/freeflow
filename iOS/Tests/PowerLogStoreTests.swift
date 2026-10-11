@@ -18,6 +18,8 @@ enum PowerLogStoreTests {
             ("unrecoverableAppendDropsRatherThanDuplicates", testUnrecoverableAppendDropsRatherThanDuplicates),
             ("clearFailureKeepsTheLogAndSaysSo", testClearFailureKeepsTheLogAndSaysSo),
             ("exportIncludesRowsThatCouldNotBeFlushed", testExportIncludesRowsThatCouldNotBeFlushed),
+            ("partialClearAdvancesAndSaysSo", testPartialClearAdvancesAndSaysSo),
+            ("exportIsCompleteWhenTheFlushLosesRows", testExportIsCompleteWhenTheFlushLosesRows),
         ]
     }
 
@@ -35,8 +37,8 @@ enum PowerLogStoreTests {
         return box.wait()
     }
 
-    private static func clearOutcome(_ store: PowerLogStore) -> Bool {
-        let box = ResultBox<Bool>()
+    private static func clearOutcome(_ store: PowerLogStore) -> PowerLogClearOutcome {
+        let box = ResultBox<PowerLogClearOutcome>()
         store.clear { box.set($0) }
         return box.wait()
     }
@@ -301,7 +303,7 @@ extension PowerLogStoreTests {
         store.append(samples(3 ..< 4)[0])
         let before = snapshot(store)
         faults.failRemove = true
-        TestSupport.expect(!clearOutcome(store), "Clear reports the failure")
+        TestSupport.expectEqual(clearOutcome(store), .failed)   // Clear reports the failure
         TestSupport.expect(store.isCurrent(before), "nothing was cleared, so earlier reads stay valid")
         let after = snapshot(store)
         TestSupport.expectEqual(after.samples, samples(0 ..< 4))
@@ -309,7 +311,7 @@ extension PowerLogStoreTests {
         TestSupport.expectEqual(files.existingFiles.count, 1)
 
         faults.failRemove = false
-        TestSupport.expect(clearOutcome(store), "Clear succeeds")
+        TestSupport.expectEqual(clearOutcome(store), .cleared)
         TestSupport.expect(!store.isCurrent(before) && !store.isCurrent(after), "older reads are stale")
         TestSupport.expectEqual(snapshot(store).samples, [])
     }
@@ -338,6 +340,52 @@ extension PowerLogStoreTests {
         try! Data().write(to: blocked)
         TestSupport.expectEqual(exportOutcome(store, into: blocked), .failed)
     }
+    /// The older file is deleted, then deleting the current one fails: what was removed is gone, so the
+    /// generation advances, and Clear says it was partial.
+    fileprivate static func testPartialClearAdvancesAndSaysSo() {
+        let directory = TestSupport.makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let faults = Faults()
+        let (store, files) = makeStore(directory, limitBytes: 400, faults: faults)
+        store.append(samples(0 ..< 1)[0])
+        store.flush()
+        store.append(samples(1 ..< 2)[0])
+        store.flush()   // rotates: two files
+        store.append(samples(2 ..< 3)[0])   // buffered
+        let before = snapshot(store)
+        TestSupport.expectEqual(before.fileCount, 2)
+        faults.removalsBeforeFailure = 1
+        TestSupport.expectEqual(clearOutcome(store), .partiallyCleared)
+        TestSupport.expect(!store.isCurrent(before), "deleted rows never come back")
+        let after = snapshot(store)
+        TestSupport.expect(store.isCurrent(after), "current")
+        TestSupport.expectEqual(files.existingFiles, [files.currentURL])
+        TestSupport.expectEqual(after.samples, samples(1 ..< 2))   // what survived; the buffer is gone too
+        faults.removalsBeforeFailure = nil
+        TestSupport.expectEqual(clearOutcome(store), .cleared)
+        TestSupport.expectEqual(snapshot(store).samples, [])
+    }
+
+    /// The flush during an export writes part of the rows and cannot undo it, so it drops them; the export
+    /// was copied from disk plus buffer before that, so it is still complete, with each row once.
+    fileprivate static func testExportIsCompleteWhenTheFlushLosesRows() {
+        let directory = TestSupport.makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let faults = Faults()
+        let (store, _) = makeStore(directory, faults: faults)
+        for sample in samples(0 ..< 2) { store.append(sample) }
+        store.flush()
+        TestSupport.expect(store.waitUntilIdle(timeout: 5), "idle")
+        faults.partialAppend = true
+        faults.failTruncate = true
+        for sample in samples(2 ..< 4) { store.append(sample) }
+        guard case .exported(let export) = exportOutcome(store, into: directory.appendingPathComponent("Exports")) else {
+            return TestSupport.expect(false, "an export")
+        }
+        let exported = export.files.flatMap { PowerLogCSV.parse(String(decoding: fileData($0), as: UTF8.self)) }
+        TestSupport.expectEqual(exported, samples(0 ..< 4))
+        TestSupport.expectEqual(snapshot(store).droppedSamples, 2)   // the flush after the copy lost them
+    }
 }
 
 private struct TestFault: Error {}
@@ -350,6 +398,13 @@ private final class Faults: @unchecked Sendable {
     private func get(_ key: String) -> Bool { lock.lock(); defer { lock.unlock() }; return flags[key] ?? false }
     private func set(_ key: String, _ value: Bool) { lock.lock(); flags[key] = value; lock.unlock() }
 
+    /// Removals after this many successful ones fail (nil: never).
+    var removalsBeforeFailure: Int? {
+        get { lock.lock(); defer { lock.unlock() }; return removalBudget }
+        set { lock.lock(); removalBudget = newValue; lock.unlock() }
+    }
+    private var removalBudget: Int?
+
     /// Appends write half of the bytes, then throw.
     var partialAppend: Bool { get { get("partialAppend") } set { set("partialAppend", newValue) } }
     var failTruncate: Bool { get { get("failTruncate") } set { set("failTruncate", newValue) } }
@@ -357,6 +412,16 @@ private final class Faults: @unchecked Sendable {
     /// Backup exclusion fails for files (the directory still succeeds).
     var failFileBackupExclusion: Bool {
         get { get("failFileBackupExclusion") } set { set("failFileBackupExclusion", newValue) }
+    }
+
+    /// True when this removal must fail.
+    private func spendRemoval() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let budget = removalBudget else { return false }
+        if budget == 0 { return true }
+        removalBudget = budget - 1
+        return false
     }
 
     var operations: PowerLogFiles.Operations {
@@ -372,7 +437,7 @@ private final class Faults: @unchecked Sendable {
             try standard.truncate(url, length)
         }
         operations.removeItem = { [self] url in
-            if failRemove { throw TestFault() }
+            if failRemove || spendRemoval() { throw TestFault() }
             try standard.removeItem(url)
         }
         operations.excludeFromBackup = { [self] url in

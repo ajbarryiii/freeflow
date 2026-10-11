@@ -7,13 +7,13 @@ import Foundation
 /// - A snapshot sees disk plus buffer at one point in that order, so no row is counted twice. An append
 ///   is all or nothing (`PowerLogFiles`); if one cannot even be undone, its rows are dropped and counted
 ///   rather than kept for a retry that would write them twice.
-/// - Each snapshot carries the generation it was read at. A successful Clear advances the generation, and
-///   `isCurrent` is false while a Clear is pending, so a read already in flight never brings cleared data
-///   back. A failed Clear reports `false`, keeps the log, and leaves the generation alone.
+/// - Each snapshot carries the generation it was read at. A Clear that deleted anything advances the
+///   generation, and `isCurrent` is false while a Clear is pending, so a read already in flight never
+///   brings deleted data back. A Clear that deleted nothing reports `.failed` and changes nothing.
 /// - After a failed write the rows stay buffered for the next flush, but only the newest
 ///   `maxBufferedSamples`; older rows are dropped and counted.
-/// - An export flushes, then copies the files into a fresh directory that nothing writes again. Rows that
-///   could not be flushed are added to the copy, so an export is complete or refused.
+/// - An export copies disk plus buffer into a fresh directory that nothing writes again, then flushes;
+///   whatever the flush does, the export is complete or refused.
 final class PowerLogStore: @unchecked Sendable {
     struct Snapshot: Sendable {
         /// Disk (oldest file first), then the buffer.
@@ -86,30 +86,34 @@ final class PowerLogStore: @unchecked Sendable {
         locked { requestedClears == finishedClears && generation == self.generation }
     }
 
-    /// Deletes the log and the buffer. `completion` (on the owner's queue) gets false when the files could
-    /// not be deleted; then the log, the buffer and the generation are kept.
-    func clear(completion: (@Sendable (Bool) -> Void)? = nil) {
+    /// Deletes the log and the buffer; `completion` runs on the owner's queue. If any file was deleted, the
+    /// buffer goes too and the generation advances, even when another file could not be deleted
+    /// (`.partiallyCleared`). If none was, nothing changes (`.failed`).
+    func clear(completion: (@Sendable (PowerLogClearOutcome) -> Void)? = nil) {
         locked { requestedClears += 1 }
         queue.async {
-            let cleared = (try? self.files.clear()) != nil
-            if cleared {
+            let outcome = self.files.clear()
+            let changed = outcome != .failed
+            if changed {
                 self.buffer.removeAll()
                 self.dropped = 0
             }
             self.locked {
-                if cleared { self.generation += 1 }
+                if changed { self.generation += 1 }
                 self.finishedClears += 1
             }
-            completion?(cleared)
+            completion?(outcome)
         }
     }
 
-    /// Flushes, then copies the log into a new directory under `directory`, excluded from backup. Rows
-    /// that could not be flushed are appended to the copy, so it holds exactly disk plus buffer.
+    /// Copies disk plus buffer into a new directory under `directory`, excluded from backup, then flushes.
+    /// The copy is taken before the buffer is consumed, so a flush that fails (or loses rows it cannot
+    /// roll back) never makes the export incomplete.
     func exportSnapshot(into directory: URL, completion: @escaping @Sendable (ExportOutcome) -> Void) {
         queue.async {
+            let outcome = self.copy(into: directory)
             self.writeBuffer()
-            completion(self.copy(into: directory))
+            completion(outcome)
         }
     }
 

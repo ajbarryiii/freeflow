@@ -3,8 +3,10 @@ import SwiftUI
 import UIKit
 
 /// Diagnostics → Power, in test builds only (ARCHITECTURE.md, "Power log"): two observed drain rates
-/// (never a projection), per-state totals, the log's size and span, Export and Clear.
+/// (never a projection), per-state totals, the log's size and span, Export, Clear, and the always-on
+/// microphone test mode's switch.
 struct PowerLogSection: View {
+    @EnvironmentObject private var host: HostSessionController
     @State private var status: PowerRecorder.Status?
     /// The share sheet's binding; SwiftUI may clear it before any cleanup runs.
     @State private var export: PowerLogStore.Export?
@@ -16,13 +18,19 @@ struct PowerLogSection: View {
 
     var body: some View {
         Section {
+            Toggle("Always-on microphone (test)",
+                   isOn: Binding(get: { host.alwaysOnMicrophone }, set: { host.setAlwaysOnMicrophone($0) }))
+                .tint(Theme.live)
+                .accessibilityIdentifier("diagnostics.power.alwaysOn")
             if let status {
                 let summary = status.summary
                 LabeledContent("Logged", value: "\(spanText(summary.span)) · \(sizeText(status.bytesOnDisk))")
                     .accessibilityIdentifier("diagnostics.power.logged")
                 VStack(alignment: .leading, spacing: 4) {
-                    LabeledContent("Mic open, background", value: drainText(summary.micOpenBackground))
+                    LabeledContent("Mic open, background, unlocked", value: drainText(summary.micOpenBackground))
                         .accessibilityIdentifier("diagnostics.power.micOpen")
+                    LabeledContent("Mic open, locked (always-on)", value: drainText(summary.micOpenLockedAlwaysOn))
+                        .accessibilityIdentifier("diagnostics.power.micOpenLocked")
                     LabeledContent("LocalFlow inactive (gaps)", value: drainText(summary.baseline))
                         .accessibilityIdentifier("diagnostics.power.baseline")
                     Text(PowerLogSummary.observedDrainNote)
@@ -86,10 +94,14 @@ struct PowerLogSection: View {
         .confirmationDialog("Delete the power log?", isPresented: $confirmingClear, titleVisibility: .visible) {
             Button("Delete", role: .destructive) {
                 Task {
-                    if await PowerRecorder.shared.clear() {
+                    switch await PowerRecorder.shared.clear() {
+                    case .cleared:
                         message = nil
                         status = nil
-                    } else {
+                    case .partiallyCleared:
+                        message = "Couldn't fully clear the log"
+                        status = nil
+                    case .failed:
                         message = "Couldn't clear the log"
                     }
                     await reload()

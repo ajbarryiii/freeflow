@@ -14,6 +14,11 @@ struct HomeView: View {
     var body: some View {
         NavigationStack(path: $path) {
             List {
+                #if LOCALFLOW_POWER_LOG
+                if host.alwaysOnMicrophone {
+                    Section { AlwaysOnBanner() }
+                }
+                #endif
                 Section {
                     SessionCard()
                 }

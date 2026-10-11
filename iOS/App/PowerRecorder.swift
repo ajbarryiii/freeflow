@@ -47,6 +47,7 @@ final class PowerRecorder {
     private var lastFlushUptime: TimeInterval = 0
     private var hostState = PowerHostState.idle
     private var computeUnits: @MainActor () -> ComputePolicy.Units? = { nil }
+    private var alwaysOn: @MainActor () -> Bool = { false }
     private var timer: Timer?
     private var observers: [NSObjectProtocol] = []
     private var isStarted = false
@@ -63,10 +64,11 @@ final class PowerRecorder {
     }
 
     /// Call once at launch, before the host's run recovery publishes its first status.
-    func start(computeUnits: @escaping @MainActor () -> ComputePolicy.Units?) {
+    func start(computeUnits: @escaping @MainActor () -> ComputePolicy.Units?, alwaysOn: @escaping @MainActor () -> Bool) {
         guard !isStarted else { return }
         isStarted = true
         self.computeUnits = computeUnits
+        self.alwaysOn = alwaysOn
         lastFlushUptime = Self.uptime()
         store?.removeExports(in: exportDirectory)   // left by a run that died while sharing
         UIDevice.current.isBatteryMonitoringEnabled = true
@@ -80,6 +82,11 @@ final class PowerRecorder {
         let state = PowerHostState(status: status)
         guard state != hostState else { return }
         hostState = state
+        if isStarted { record(.state) }
+    }
+
+    /// The always-on test mode was switched: a sample marks the boundary.
+    func alwaysOnChanged() {
         if isStarted { record(.state) }
     }
 
@@ -113,9 +120,9 @@ final class PowerRecorder {
         store?.removeExport(export)
     }
 
-    /// False when the log could not be deleted; it is then kept as it was.
-    func clear() async -> Bool {
-        guard let store else { return false }
+    /// `.failed` keeps the log as it was; `.partiallyCleared` deleted some of it.
+    func clear() async -> PowerLogClearOutcome {
+        guard let store else { return .failed }
         return await withCheckedContinuation { continuation in
             store.clear { continuation.resume(returning: $0) }
         }
@@ -123,10 +130,13 @@ final class PowerRecorder {
 
     // MARK: Private
 
-    private func record(_ trigger: PowerTrigger) {
+    /// `protectedData` overrides the reading where the notification knows better: during "will become
+    /// unavailable" iOS still reports protected data as available.
+    private func record(_ trigger: PowerTrigger, protectedData: PowerProtectedData? = nil) {
         guard let store else { return }
         let now = Self.uptime()
-        let sample = sample(trigger, uptime: now)
+        var sample = sample(trigger, uptime: now)
+        if let protectedData { sample.protectedData = protectedData }
         store.append(sample)
         // Nothing but LocalFlow's own front or its audio session and work keeps it running.
         let justified = sample.appState == .foreground || hostState != .idle
@@ -189,14 +199,16 @@ final class PowerRecorder {
             batteryLevel: Double(device.batteryLevel), batteryState: batteryState,
             lowPowerMode: ProcessInfo.processInfo.isLowPowerModeEnabled, thermalState: thermalState,
             cpuUserSeconds: cpu.user, cpuSystemSeconds: cpu.system, memoryMB: footprint?.currentMB,
-            memoryPeakMB: footprint?.peakMB, computeUnits: computeUnits(), build: build, device: self.device)
+            memoryPeakMB: footprint?.peakMB, computeUnits: computeUnits(), build: build, device: self.device,
+            alwaysOn: alwaysOn(),
+            protectedData: UIApplication.shared.isProtectedDataAvailable ? .available : .unavailable)
     }
 
     private func observeNotifications() {
         let center = NotificationCenter.default
-        func on(_ name: Notification.Name, _ trigger: PowerTrigger) {
+        func on(_ name: Notification.Name, _ trigger: PowerTrigger, protectedData: PowerProtectedData? = nil) {
             observers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                MainActor.assumeIsolated { self?.record(trigger) }
+                MainActor.assumeIsolated { self?.record(trigger, protectedData: protectedData) }
             })
         }
         on(UIApplication.willEnterForegroundNotification, .foreground)
@@ -206,6 +218,8 @@ final class PowerRecorder {
         on(UIDevice.batteryStateDidChangeNotification, .battery)
         on(ProcessInfo.thermalStateDidChangeNotification, .thermal)
         on(Notification.Name.NSProcessInfoPowerStateDidChange, .powerMode)
+        on(UIApplication.protectedDataWillBecomeUnavailableNotification, .protectedData, protectedData: .unavailable)
+        on(UIApplication.protectedDataDidBecomeAvailableNotification, .protectedData, protectedData: .available)
     }
 
     /// Continues while the device sleeps (unlike `systemUptime`), so suspended intervals within one run

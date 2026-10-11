@@ -10,6 +10,7 @@ enum PowerLogSummaryTests {
             ("perStateTimeCPUAndBattery", testPerStateTimeCPUAndBattery),
             ("observedRatesStayApart", testObservedRatesStayApart),
             ("labelsSayWhatTheRatesAreNot", testLabelsSayWhatTheRatesAreNot),
+            ("lockedAlwaysOnRateIsSeparate", testLockedAlwaysOnRateIsSeparate),
             ("confidenceThreshold", testConfidenceThreshold),
             ("chargingIsExcludedFromDrain", testChargingIsExcludedFromDrain),
             ("unknownBatteryLevelIsExcludedFromDrain", testUnknownBatteryLevelIsExcludedFromDrain),
@@ -145,6 +146,31 @@ enum PowerLogSummaryTests {
                                 "Observed whole-device drain; screen conditions differ. Microphone cost requires matched runs.")
         TestSupport.expectEqual(PowerLogSummary.gapNote,
                                 "Gaps are uncontrolled: the phone may have charged in between, so this is not a measurement.")
+    }
+
+    /// Always-on, locked, with the microphone open: its own observed rate. Locked time never counts toward
+    /// the unlocked background figure, and locked micOpen without the mode (a lock just ending a session)
+    /// counts toward neither.
+    private static func testLockedAlwaysOnRateIsSeparate() {
+        var samples = [S.sample(0, .state, host: .micOpen, app: .background, level: 0.90, alwaysOn: true)]
+        // Locked for 2 h, losing 6 points, sampled each minute.
+        samples += (0 ... 120).map { minute in
+            let level = ((90 - (6 * Double(minute) / 120).rounded(.down)).rounded()) / 100
+            return S.sample(60 + Double(minute) * 60, minute == 0 ? .protectedData : .periodic, host: .micOpen,
+                            app: .background, level: level, alwaysOn: true, protected: .unavailable)
+        }
+        let unlock = 60 + 120 * 60.0
+        samples.append(S.sample(unlock, .protectedData, host: .micOpen, app: .background, level: 0.84, alwaysOn: true))
+        samples.append(S.sample(unlock + 60, .periodic, host: .micOpen, app: .background, level: 0.84,
+                                alwaysOn: false, protected: .unavailable))
+        samples.append(S.sample(unlock + 120, .state, host: .idle, app: .background, level: 0.84,
+                                protected: .unavailable))
+        let summary = PowerLogSummary(samples: samples)
+        expectClose(summary.micOpenLockedAlwaysOn.seconds, 7_200, "locked always-on seconds")
+        expectClose(summary.micOpenLockedAlwaysOn.percent, 6, "locked always-on drop")
+        expectClose(summary.micOpenLockedAlwaysOn.percentPerHour, 3, "locked always-on rate")
+        expectClose(summary.micOpenBackground.seconds, 60 + 60, "unlocked background micOpen only")
+        expectClose(summary.states[.micOpen]?.seconds, 60 + 7_200 + 60 + 60, "all micOpen time still counts")
     }
 
     private static func testChargingIsExcludedFromDrain() {

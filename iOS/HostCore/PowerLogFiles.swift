@@ -8,6 +8,11 @@ struct PowerLogAppendFailure: Error {
     var underlying: Error
 }
 
+/// What a Clear achieved. `partiallyCleared`: some files were deleted and others could not be.
+enum PowerLogClearOutcome: Sendable, Equatable {
+    case cleared, partiallyCleared, failed
+}
+
 /// The power log on disk (test builds only): a current file and at most one rotated, older file in a
 /// directory excluded from backup. The caller chooses the directory and names, so nothing outside the
 /// `LOCALFLOW_POWER_LOG` gate names a power-log file. Not thread-safe; one owner calls it.
@@ -111,8 +116,12 @@ final class PowerLogFiles {
         }
     }
 
-    func clear() throws {
-        for url in existingFiles { try operations.removeItem(url) }
+    /// Deletes both files, older first, and says how far it got.
+    func clear() -> PowerLogClearOutcome {
+        let files = existingFiles
+        let removed = files.filter { (try? operations.removeItem($0)) != nil }.count
+        if removed == files.count { return .cleared }
+        return removed == 0 ? .failed : .partiallyCleared
     }
 
     // MARK: Private

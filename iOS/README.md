@@ -36,7 +36,7 @@ unchanged copy of the 330 MB model instead of copying it again.
 | `PARAKEET_BUNDLE_DIR` | empty | model bundle to embed |
 | `BUILD_DIR` | `build/$(PLATFORM)` | output directory |
 | `SWIFT_FLAGS` | empty | extra compiler flags, e.g. `-D LOCALFLOW_SELFTEST` |
-| `POWER_LOG` | `0` | `1` builds a power test build: the host app records a content-free power log ([POWER-TESTING.md](POWER-TESTING.md)); never for production |
+| `POWER_LOG` | `0` | `1` builds a power test build into `$(BUILD_DIR)-power` (e.g. `build/simulator-power`): the host app records a content-free power log ([POWER-TESTING.md](POWER-TESTING.md)); never for production |
 | `CODESIGN_IDENTITY`, `TEAM_ID`, `APP_PROFILE`, `KEYBOARD_PROFILE` | `-` on the simulator | device signing |
 
 Source lists (`APP_SWIFT_SOURCES`, `KEYBOARD_SWIFT_SOURCES`, `SHARED_SOURCES`, `KEYBOARDCORE_SOURCES`,
@@ -245,6 +245,7 @@ Setup and session:
 - [ ] Kill LocalFlow during recording: the request reports interrupted and never restarts; no result file remains.
 - [ ] Battery: 30 min idle session vs no session (and vs Wispr Flow if installed).
 - [ ] Power test build (`POWER_LOG=1`): Diagnostics → Power shows both observed rates with their notes; Export shares snapshot copies that are gone afterwards; Clear empties the log ([POWER-TESTING.md](POWER-TESTING.md)).
+- [ ] Always-on test mode (`POWER_LOG=1`): the switch persists; the Home banner shows and Turn off works; a lock cancels a dictation but the session stays, with the orange indicator on the lock screen; after unlock the next dictation starts without opening LocalFlow; turning it off restores idle expiry and lock ending the session.
 - [ ] Peak memory during a 5-minute dictation; no jetsam in the background.
 
 Keyboard (compare side by side with Apple's keyboard in Try it → Cursor practice):

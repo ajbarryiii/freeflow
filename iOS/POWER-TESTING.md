@@ -17,8 +17,12 @@ field or app context. It stays on the phone until you export it.
 ## Build
 
 `POWER_LOG=1` compiles the recorder into the host app only, never the
-keyboard. The default is `0`, and production builds must stay `0`. Changing it
-rebuilds automatically.
+keyboard. The default is `0`, and production builds must stay `0`. A power
+build writes everything to its own directory, `$(BUILD_DIR)-power`, so it
+never shares objects, binaries or bundles with a normal build. For example,
+`BUILD_DIR=build/device POWER_LOG=1` produces `iOS/build/device-power/LocalFlow.app`,
+and `iOS/build/device/LocalFlow.app` stays the normal build. A `BUILD_DIR`
+ending in `-power` is refused with `POWER_LOG=0`.
 
 ```bash
 make -C iOS all PLATFORM=device POWER_LOG=1 "${SIGN[@]}"     # SIGN as in README.md → Device
@@ -26,12 +30,13 @@ make -C iOS install-device PLATFORM=device POWER_LOG=1 "${SIGN[@]}" DEVICE=<name
 ```
 
 To publish to the OTA page, add `POWER_LOG=1` to the `make -C iOS all` line of
-the publish script.
+the publish script, and point its OTA step at `iOS/build/device-power/LocalFlow.app`.
 
 Check a build before you publish it:
 
 ```bash
-nm iOS/build/device/obj/LocalFlow | grep -c PowerRecorder   # > 0 power build, 0 normal build
+nm iOS/build/device-power/LocalFlow.app/LocalFlow | grep -c PowerRecorder   # > 0: a power build
+nm iOS/build/device/LocalFlow.app/LocalFlow | grep -c PowerRecorder         # 0: a normal build
 ```
 
 In a power build, Diagnostics has a **Power (test build)** section.
@@ -52,8 +57,9 @@ everything else equal. Gaps are also uncontrolled: the log cannot prove the
 phone stayed unplugged between two samples.
 
 LocalFlow ends a session when the phone locks, and after at most 60 minutes
-without dictation. So the microphone can only stay open with the screen on,
-and the baseline must have the screen on too.
+without dictation (except in the always-on test mode, below). So in a normal
+session the microphone can only stay open with the screen on, and the baseline
+must have the screen on too.
 
 1. **Match the start.**
    - Begin each run at the same charge, for example 80–85 %, unplugged.
@@ -94,6 +100,31 @@ and the baseline must have the screen on too.
 7. Optional: a screen-off baseline overnight, which shows the phone's own idle
    drain.
 
+### Overnight: always-on locked vs no session locked
+
+The always-on microphone test mode (Diagnostics → Power → "Always-on
+microphone (test)", power builds only) keeps the session through lock and
+idle, so the microphone's screen-off cost can be measured. While it is on,
+Home shows a banner with a Turn off button.
+
+1. Run the two nights back to back, with the same start charge, room and
+   settings. Note the bedtime and wake times. Don't touch the phone in between.
+2. **Night A, always-on locked.**
+   1. In the evening, open LocalFlow (the endpoint), turn the mode on, warm the
+      model with one dictation, and start a session.
+   2. Lock the phone and leave it unplugged overnight.
+   3. In the morning, unlock and open LocalFlow (the end endpoint).
+   4. Turn the mode off, then send LocalFlow to the background (which flushes).
+3. **Night B, no session locked.** Same steps, with the mode off and no
+   session. LocalFlow is suspended, so the night is a gap between the two
+   endpoints.
+4. Night A's rows show `always_on=true` and `protected_data=unavailable` while
+   locked, and they keep coming every minute. A long silence followed by a
+   `launch` row means iOS terminated the app, for example for memory.
+5. The microphone's screen-off cost is rate(A) − rate(B), from the endpoints.
+   The in-app "Mic open, locked (always-on)" figure is the same kind of
+   observed rate as the others, never a projection.
+
 The in-app rates need at least 1 h and a 3-point drop before they show. They
 read "Observed whole-device drain; screen conditions differ. Microphone cost
 requires matched runs." There is no projection. Compute the microphone's cost
@@ -128,7 +159,9 @@ from much later.
 
 `power-log.csv` is the current file. `power-log.1.csv`, when present, is the
 older file (the log rotates at 4 MB, about two weeks). Read the older file
-first. Each file starts with the header row, then `# schema=1`. Skip lines
+first. Each file starts with the header row, then `# schema=2` (an older
+`# schema=1` file has no `always_on` or `protected_data` columns: read the mode
+as off and protected data as unknown). Skip lines
 starting with `#`, and ignore a last line that has no final newline (a write
 cut short). Fields with a comma are quoted (`"iPhone16,1"`). Decimals always
 use `.`.
@@ -137,7 +170,7 @@ use `.`.
 | --- | --- |
 | `wall_time` | ISO 8601 UTC, milliseconds |
 | `uptime_s` | monotonic seconds, counting sleep; comparable within one process run only |
-| `trigger` | `periodic` (60 s), `state`, `battery`, `thermal`, `powerMode`, `launch`, `foreground`, `background`, `terminate` |
+| `trigger` | `periodic` (60 s), `state` (including the mode switched), `battery`, `thermal`, `powerMode`, `launch`, `foreground`, `background`, `terminate`, `protectedData` (lock or unlock) |
 | `host_state` | `idle` (no audio session), `micOpen` (session, no dictation), `recording`, `transcribing`, `preparing` (model load or compile) |
 | `app_state` | `foreground` or `background` |
 | `battery_level` | `UIDevice.batteryLevel`, 0–1, `-1` when unknown |
@@ -148,6 +181,8 @@ use `.`.
 | `memory_mb`, `memory_peak_mb` | footprint as jetsam counts it; empty if unavailable |
 | `compute_units` | `cpuAndNeuralEngine` or `cpuOnly` while a model runtime is loaded, else empty |
 | `build`, `device` | `CFBundleVersion` and the hardware model |
+| `always_on` | `true` or `false`: the always-on microphone test mode |
+| `protected_data` | `available` or `unavailable` (locked, a proxy for screen off); empty if unknown |
 
 A sample is taken at every transition, so each interval between two
 consecutive rows belongs to the **first** row's state. The in-app summary

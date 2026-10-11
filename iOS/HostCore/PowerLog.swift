@@ -8,7 +8,12 @@ import Foundation
 /// Why a sample was taken.
 enum PowerTrigger: String, CaseIterable, Sendable {
     case periodic, state, battery, thermal, powerMode, launch, foreground, background, terminate
+    /// Schema 2: protected data became unavailable (locked) or available again.
+    case protectedData
 }
+
+/// `UIApplication.isProtectedDataAvailable`; unavailable means locked (a proxy for screen off).
+enum PowerProtectedData: String, CaseIterable, Sendable { case available, unavailable }
 
 /// What the host was doing, derived from its published status.
 enum PowerHostState: String, CaseIterable, Sendable {
@@ -65,20 +70,27 @@ struct PowerSample: Equatable, Sendable {
     var computeUnits: ComputePolicy.Units?
     var build: String
     var device: String
+    /// Schema 2: the always-on microphone test mode at sample time; false in schema 1 files.
+    var alwaysOn = false
+    /// Schema 2; nil in schema 1 files.
+    var protectedData: PowerProtectedData? = nil
 
     var cpuSeconds: Double { cpuUserSeconds + cpuSystemSeconds }
 }
 
-/// Schema 1: a header row, a `# schema=1` line, then one row per sample. `.` is the decimal separator
+/// Schema 2: a header row, a `# schema=2` line, then one row per sample. Schema 1 files (no `always_on`
+/// or `protected_data`) still read. `.` is the decimal separator
 /// whatever the locale; text fields are quoted when needed and never span lines.
 enum PowerLogCSV {
-    static let schema = 1
+    static let schema = 2
     static let columns = [
         "wall_time", "uptime_s", "trigger", "host_state", "app_state", "battery_level", "battery_state",
         "low_power_mode", "thermal_state", "cpu_user_s", "cpu_system_s", "memory_mb", "memory_peak_mb",
-        "compute_units", "build", "device",
+        "compute_units", "build", "device", "always_on", "protected_data",
     ]
     static let header = columns.joined(separator: ",")
+    /// Schema 1's header: the first 16 columns.
+    static let schema1Header = columns.prefix(16).joined(separator: ",")
     static let schemaLine = "# schema=\(schema)"
     static let preamble = header + "\n" + schemaLine + "\n"
 
@@ -101,6 +113,8 @@ enum PowerLogCSV {
             sample.computeUnits?.rawValue ?? "",
             text(sample.build),
             text(sample.device),
+            sample.alwaysOn ? "true" : "false",
+            sample.protectedData?.rawValue ?? "",
         ].joined(separator: ",")
     }
 
@@ -111,32 +125,33 @@ enum PowerLogCSV {
         return String(format: "%.\(places)f", locale: posix, rounded == 0 ? 0 : rounded)
     }
 
-    /// Samples from a whole file. Skips comments, blank lines, rows that do not parse, rows under a
-    /// header of another schema, and the last line unless it ends with a newline (a write cut short).
+    /// Samples from a whole file, schema 2 or 1. Skips comments, blank lines, rows that do not parse, rows
+    /// under a header of an unknown schema, and the last line unless it ends with a newline (a write cut
+    /// short).
     static func parse(_ text: String) -> [PowerSample] {
         // "\r\n" is a single Character in Swift, so it is a separator of its own.
         var lines = text.split(omittingEmptySubsequences: false, whereSeparator: { $0 == "\n" || $0 == "\r\n" })
         lines.removeLast()   // empty after a final newline, otherwise an unterminated (truncated) row
         var samples: [PowerSample] = []
-        var foreignSchema = false
+        var readable: Int? = schema   // the schema rows are read as; nil under an unknown header
         for raw in lines {
             let line = raw.hasSuffix("\r") ? raw.dropLast() : raw
             if line.isEmpty { continue }
             if line.hasPrefix("#") {
-                if line.hasPrefix("# schema=") { foreignSchema = line != schemaLine }
+                if line.hasPrefix("# schema="), let current = readable, line != "# schema=\(current)" { readable = nil }
                 continue
             }
             if line.hasPrefix("wall_time,") {
-                foreignSchema = line != header
+                readable = line == header ? schema : line == schema1Header ? 1 : nil
                 continue
             }
-            if !foreignSchema, let sample = sample(fromLine: line) { samples.append(sample) }
+            if let readable, let sample = sample(fromLine: line, schema: readable) { samples.append(sample) }
         }
         return samples
     }
 
-    static func sample<Line: StringProtocol>(fromLine line: Line) -> PowerSample? {
-        guard let fields = split(line), fields.count == columns.count,
+    static func sample<Line: StringProtocol>(fromLine line: Line, schema: Int = PowerLogCSV.schema) -> PowerSample? {
+        guard schema == 1 || schema == 2, let fields = split(line), fields.count == (schema == 1 ? 16 : columns.count),
               let wallTime = parseWallTime(fields[0]),
               let uptime = number(fields[1]),
               let trigger = PowerTrigger(rawValue: fields[2]),
@@ -158,11 +173,21 @@ enum PowerLogCSV {
             guard let parsed = ComputePolicy.Units(rawValue: fields[13]) else { return nil }
             units = parsed
         }
+        var alwaysOn = false
+        var protectedData: PowerProtectedData?
+        if schema == 2 {
+            guard let on = ["false": false, "true": true][fields[16]] else { return nil }
+            alwaysOn = on
+            if !fields[17].isEmpty {
+                guard let parsed = PowerProtectedData(rawValue: fields[17]) else { return nil }
+                protectedData = parsed
+            }
+        }
         return PowerSample(wallTime: wallTime, uptime: uptime, trigger: trigger, hostState: hostState, appState: appState,
                            batteryLevel: batteryLevel < 0 ? -1 : batteryLevel, batteryState: batteryState,
                            lowPowerMode: lowPowerMode, thermalState: thermalState, cpuUserSeconds: cpuUser,
                            cpuSystemSeconds: cpuSystem, memoryMB: memory, memoryPeakMB: memoryPeak, computeUnits: units,
-                           build: fields[14], device: fields[15])
+                           build: fields[14], device: fields[15], alwaysOn: alwaysOn, protectedData: protectedData)
     }
 
     // MARK: Private

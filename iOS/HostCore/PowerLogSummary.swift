@@ -60,9 +60,12 @@ struct PowerLogSummary: Equatable, Sendable {
     /// Time suspended or not running. Its drain is the "LocalFlow inactive" figure, uncontrolled: only the
     /// endpoints are known, so a charge in between that ends unplugged at a lower level goes unseen.
     var inactive = Totals()
-    /// The background microphone with no dictation, as observed: whole-device drain with whatever screen
+    /// The background microphone with no dictation and not locked, as observed: whole-device drain with whatever screen
     /// and use came with it, not the microphone's own cost.
     var micOpenBackground = Drain()
+    /// The microphone open while locked in the always-on test mode (schema 2), as observed: whole-device
+    /// drain with the screen off. Same labelling as the other rates; never a projection.
+    var micOpenLockedAlwaysOn = Drain()
     var unknownSeconds = 0.0
     /// Time excluded from drain because the battery was not unplugged (or charged in between).
     var pluggedInSeconds = 0.0
@@ -110,8 +113,13 @@ struct PowerLogSummary: Equatable, Sendable {
                 totals.drainSeconds += duration
                 totals.drainPercent += drop
                 if a.hostState == .micOpen, a.appState == .background {
-                    micOpenBackground.seconds += duration
-                    micOpenBackground.percent += drop
+                    if a.protectedData != .unavailable {
+                        micOpenBackground.seconds += duration
+                        micOpenBackground.percent += drop
+                    } else if a.alwaysOn {
+                        micOpenLockedAlwaysOn.seconds += duration
+                        micOpenLockedAlwaysOn.percent += drop
+                    }
                 }
             }
             states[a.hostState] = totals

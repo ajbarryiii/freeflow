@@ -1382,3 +1382,241 @@ private final class FakeTranscriber: HostTranscriber {
         pending.remove(at: index).continuation.resume(with: result)
     }
 }
+
+/// The always-on microphone test mode (ARCHITECTURE.md, "Always-on microphone test mode"; only
+/// `LOCALFLOW_POWER_LOG` code sets it): no idle expiry, and a lock cancels a dictation but keeps the
+/// session. Driven through the real core with the same fakes and event sequences as above.
+enum HostSessionAlwaysOnTests {
+    static var tests: [TestCase] {
+        [
+            ("offByDefault", isolated(testOffByDefault)),
+            ("lockCancelsDictationButKeepsTheSession", isolated(testLockCancelsDictationButKeepsTheSession)),
+            ("lockCancelsTranscriptionButKeepsTheSession", isolated(testLockCancelsTranscriptionButKeepsTheSession)),
+            ("noIdleExpiry", isolated(testNoIdleExpiry)),
+            ("turningOffCountsIdleFromTheToggle", isolated(testTurningOffCountsIdleFromTheToggle)),
+            ("turningOffMakesTheNextLockEndTheSession", isolated(testTurningOffMakesTheNextLockEndTheSession)),
+            ("otherEndReasonsStillEndTheSession", isolated(testOtherEndReasonsStillEndTheSession)),
+            ("neverStartsASessionInTheBackground", isolated(testNeverStartsASessionInTheBackground)),
+            ("unlockAdmitsTheNextIntentWithoutARestart", isolated(testUnlockAdmitsTheNextIntentWithoutARestart)),
+            ("settingItBeforeLaunchPublishesNothing", isolated(testSettingItBeforeLaunchPublishesNothing)),
+        ]
+    }
+
+    private static func isolated(_ body: @escaping @MainActor () -> Void) -> () -> Void {
+        { MainActor.assumeIsolated { body() } }
+    }
+
+    private static let R = Fixture.requestID
+    private static let S = Fixture.otherRequestID
+
+    /// An always-on session running with LocalFlow in the background, as after the user swipes away.
+    @MainActor
+    private static func backgroundSession(_ h: CoreHarness) {
+        h.core.setAlwaysOn(true)
+        h.core.userStartSession()
+        TestSupport.expectEqual(h.core.session, .active)
+        h.clock.isForeground = false
+        h.core.foregroundChanged()
+    }
+
+    @MainActor
+    private static func testOffByDefault() {
+        let h = CoreHarness()
+        defer { h.cleanup() }
+        TestSupport.expect(!h.core.alwaysOn, "off by default")
+        h.core.userStartSession()
+        TestSupport.expectEqual(h.status?.sessionExpiresAt, Fixture.now + 300)
+        h.core.deviceWillLock()
+        TestSupport.expectEqual(h.core.session, .inactive)
+        TestSupport.expectEqual(h.status?.error, .deviceLocked)
+    }
+
+    @MainActor
+    private static func testLockCancelsDictationButKeepsTheSession() {
+        let h = CoreHarness()
+        defer { h.cleanup() }
+        h.core.setAlwaysOn(true)
+        h.record(R)
+        let sessionID = h.core.sessionID
+        h.core.deviceWillLock()
+        TestSupport.expectEqual(h.status?.dictation?.phase, .cancelled)
+        TestSupport.expectEqual(h.status?.dictation?.error, .deviceLocked)
+        TestSupport.expectEqual(h.buffer.recordingRequestID, nil)   // buffers are dropped again
+        TestSupport.expectEqual(h.core.session, .active)
+        TestSupport.expectEqual(h.status?.session, .active)
+        TestSupport.expectEqual(h.status?.error, nil)
+        TestSupport.expectEqual(h.core.sessionID, sessionID)
+        TestSupport.expectEqual(h.capture.isRunning, true)
+        TestSupport.expectEqual(h.capture.startCount, 1)
+        TestSupport.expectEqual(h.status?.sessionExpiresAt, nil)   // no expiry while on
+    }
+
+    @MainActor
+    private static func testLockCancelsTranscriptionButKeepsTheSession() {
+        let h = CoreHarness()
+        defer { h.cleanup() }
+        h.core.setAlwaysOn(true)
+        h.transcriber.honorsCancellation = false   // a runtime that finishes anyway: the fence must drop it
+        h.record(R)
+        h.writeIntent(.finish, R)
+        h.core.reconcile(.intentSignal)
+        h.completeTail()
+        _ = TestSupport.waitUntil(timeout: 2) { h.transcriber.pendingCount == 1 }
+        h.core.deviceWillLock()
+        TestSupport.expectEqual(h.status?.dictation?.phase, .cancelled)
+        TestSupport.expectEqual(h.status?.dictation?.error, .deviceLocked)
+        TestSupport.expectEqual(h.background.ended, 1)
+        TestSupport.expectEqual(h.core.session, .active)
+        TestSupport.expectEqual(h.capture.isRunning, true)
+        h.transcriber.complete(.success("late words"))
+        _ = TestSupport.waitUntil(timeout: 0.2) { false }
+        TestSupport.expectEqual(h.store.readResult(requestID: R), .absent)
+        TestSupport.expectEqual(h.core.current?.phase, .cancelled)
+    }
+
+    /// Eight hours locked in the background, ticking every minute: the session never expires.
+    @MainActor
+    private static func testNoIdleExpiry() {
+        let h = CoreHarness()
+        defer { h.cleanup() }
+        backgroundSession(h)
+        h.core.deviceWillLock()
+        for _ in 0 ..< 8 * 60 {
+            h.clock.now += 60
+            h.keepCaptureFresh()
+            h.core.tick()
+        }
+        TestSupport.expectEqual(h.core.session, .active)
+        TestSupport.expectEqual(h.status?.session, .active)
+        TestSupport.expectEqual(h.capture.isRunning, true)
+        TestSupport.expectEqual(h.capture.startCount, 1)
+        TestSupport.expectEqual(h.core.sessionExpiresAt, nil)
+    }
+
+    @MainActor
+    private static func testTurningOffCountsIdleFromTheToggle() {
+        let h = CoreHarness()
+        defer { h.cleanup() }
+        h.core.setAlwaysOn(true)
+        h.core.userStartSession()
+        h.clock.now += 3_600
+        h.keepCaptureFresh()
+        h.core.tick()
+        TestSupport.expectEqual(h.core.session, .active)
+        let off = h.clock.now
+        h.core.setAlwaysOn(false)
+        TestSupport.expect(!h.core.alwaysOn, "off")
+        TestSupport.expectEqual(h.core.sessionExpiresAt, off + 300)
+        TestSupport.expectEqual(h.status?.sessionExpiresAt, off + 300)   // published at once
+        h.clock.now = off + 300
+        h.keepCaptureFresh()
+        h.core.tick()
+        TestSupport.expectEqual(h.core.session, .active)
+        h.clock.now += 0.1
+        h.core.tick()
+        TestSupport.expectEqual(h.core.session, .inactive)
+        TestSupport.expectEqual(h.status?.error, nil)
+    }
+
+    @MainActor
+    private static func testTurningOffMakesTheNextLockEndTheSession() {
+        let h = CoreHarness()
+        defer { h.cleanup() }
+        backgroundSession(h)
+        h.core.deviceWillLock()
+        TestSupport.expectEqual(h.core.session, .active)
+        h.core.setAlwaysOn(false)
+        TestSupport.expectEqual(h.core.session, .active)   // turning off ends nothing by itself
+        h.core.deviceWillLock()
+        TestSupport.expectEqual(h.core.session, .inactive)
+        TestSupport.expectEqual(h.status?.error, .deviceLocked)
+        TestSupport.expectEqual(h.capture.isRunning, false)
+    }
+
+    /// An interruption, an engine that cannot be restarted and End session still end it; the next
+    /// foreground session is always-on again.
+    @MainActor
+    private static func testOtherEndReasonsStillEndTheSession() {
+        let h = CoreHarness()
+        defer { h.cleanup() }
+        h.core.setAlwaysOn(true)
+        h.record(R)
+        h.core.captureInterrupted()
+        TestSupport.expectEqual(h.status?.session, .inactive)
+        TestSupport.expectEqual(h.status?.error, .interrupted)
+        TestSupport.expectEqual(h.status?.dictation?.error, .interrupted)
+
+        h.core.userStartSession()
+        h.clock.isForeground = false
+        h.core.foregroundChanged()
+        h.capture.failRestart = true
+        h.core.captureFailed(generation: h.capture.engineGeneration)
+        h.clock.now += HostSessionPolicy.captureStallGrace + 0.001
+        h.core.tick()
+        TestSupport.expectEqual(h.status?.session, .inactive)
+        TestSupport.expectEqual(h.status?.error, .audioSessionFailed)
+
+        h.clock.isForeground = true
+        h.capture.failRestart = false
+        h.core.userStartSession()
+        h.core.deviceWillLock()
+        TestSupport.expectEqual(h.core.session, .active)   // still always-on
+        h.core.userEndSession()
+        TestSupport.expectEqual(h.status?.session, .inactive)
+        TestSupport.expectEqual(h.capture.isRunning, false)
+        TestSupport.expect(h.core.alwaysOn, "the mode outlives the session")
+    }
+
+    @MainActor
+    private static func testNeverStartsASessionInTheBackground() {
+        let h = CoreHarness()
+        defer { h.cleanup() }
+        h.clock.isForeground = false
+        h.core.foregroundChanged()
+        h.core.setAlwaysOn(true)
+        h.core.deviceWillLock()
+        h.clock.now += 600
+        h.core.tick()
+        h.writeIntent(.record, R)
+        h.core.reconcile(.intentSignal)
+        TestSupport.expectEqual(h.core.session, .inactive)
+        TestSupport.expectEqual(h.capture.startCount, 0)
+    }
+
+    /// Locked in the background, then unlocked: the keyboard's next record intent is admitted into the
+    /// same session, with no capture start or session restart.
+    @MainActor
+    private static func testUnlockAdmitsTheNextIntentWithoutARestart() {
+        let h = CoreHarness()
+        defer { h.cleanup() }
+        backgroundSession(h)
+        let sessionID = h.core.sessionID
+        h.core.deviceWillLock()
+        h.clock.now += 2 * 3_600
+        h.keepCaptureFresh()
+        h.core.tick()
+        try! h.store.writePresence(Fixture.presence(seenAt: h.clock.now))
+        h.writeIntent(.record, S)
+        h.core.reconcile(.intentSignal)
+        TestSupport.expectEqual(h.core.current?.requestID, S)
+        h.deliver()
+        TestSupport.expect(TestSupport.waitUntil(timeout: 2) { h.core.current?.phase == .recording }, "not recording")
+        TestSupport.expectEqual(h.core.sessionID, sessionID)
+        TestSupport.expectEqual(h.capture.startCount, 1)
+        TestSupport.expectEqual(h.capture.restartCount, 0)
+    }
+
+    /// Set at app start, before run recovery has read the previous run's status: it must not write one.
+    @MainActor
+    private static func testSettingItBeforeLaunchPublishesNothing() {
+        let h = CoreHarness(launch: false)
+        defer { h.cleanup() }
+        h.core.setAlwaysOn(true)
+        TestSupport.expectEqual(h.store.readStatus(), .absent)
+        TestSupport.expect(h.core.alwaysOn, "set")
+        h.core.launch()
+        h.core.userStartSession()
+        h.core.deviceWillLock()
+        TestSupport.expectEqual(h.core.session, .active)
+    }
+}
