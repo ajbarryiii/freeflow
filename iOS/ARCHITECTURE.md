@@ -1438,8 +1438,16 @@ the power log alone cannot observe this.
   state until `protectedDataDidBecomeAvailable`. While locked, no intent is
   admitted and no pending capture or dictation starts, even if the intent
   file is still readable: iOS posts the notification before files become
-  inaccessible. An intent that arrives while locked is never admitted later
-  (added after the always-on review).
+  inaccessible. An intent read while locked is refused and never admitted
+  later. An intent the host could not read while locked gets only the normal
+  freshness check after unlock; there is no "issued before unlock" rule,
+  because the keyboard writes an intent before the host comes forward.
+  The latch clears on `protectedDataDidBecomeAvailable`, and also whenever
+  the app becomes active or enters the foreground with protected data
+  available, because a suspended app can miss the unlock notification. It
+  is never cleared by polling during the will-become-unavailable window,
+  where UIKit still reports data as available (added after the always-on
+  review).
 - **Unlock:** dictation continues instantly. Nothing about the session
   restarts.
 - **Other end reasons:** unchanged. These are an interruption, an
