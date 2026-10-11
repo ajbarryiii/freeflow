@@ -1310,11 +1310,20 @@ build number and the hardware model identifier:
 - **Probe cost:** the recorder samples only while something else (the app
   in front, or an active audio session) keeps the process running. It never
   keeps the process awake or delays suspension on its own, and adds no
-  wakeups beyond the 60 s timer. Samples are buffered and written at
-  most every 5 minutes, and on every background transition or termination.
+  wakeups beyond the 60 s timer. When background execution is no longer
+  justified (the app is in the background with no audio session, e.g.
+  after lock or idle expiry), it records the boundary, flushes, and
+  invalidates the timer. Sampling resumes on foreground or a new session.
+  Samples are buffered and written at most every 5 minutes, and at every
+  such boundary and at termination. All file work (encoding, rotation,
+  writes, reads for the summary, snapshots for export, clear) runs on one
+  serialized owner off the main thread, so readers see one consistent
+  snapshot and a clear is never undone by a read already in flight.
 - **Gaps:** time the app was suspended or not running appears as a gap
   between consecutive samples. The analysis treats a gap as the "LocalFlow
-  inactive" baseline.
+  inactive" baseline. Its charging history is unknown: the endpoints
+  cannot prove the phone stayed unplugged in between. Gap figures are
+  labelled as such and are never presented as a controlled measurement.
 
 **Storage.** `Application Support/PowerLog/power-log.csv` in the app's own
 container, excluded from backup. It is never in the App Group: the keyboard
@@ -1330,20 +1339,25 @@ with a header row and a `# schema=1` comment line.
   - per host state: total time, CPU seconds and battery percent consumed
   - drain rate in percent per hour for `micOpen` in the background versus
     the inactive-gap baseline
-  - the projection "always-open microphone ≈ (micOpen rate − baseline
-    rate) × 24 % per day"
   - CPU seconds per transcription
 - **Charging:** intervals in which the battery state is not `unplugged` are
   excluded from drain figures.
+- **No automatic projection** (changed after the power-log review): sessions
+  need the screen on and end at lock, while gaps include screen-off time,
+  so the difference would mostly measure the display. The summary shows
+  both observed rates, labelled "Observed whole-device drain; screen
+  conditions differ. Microphone cost requires matched runs."
+  (POWER-TESTING.md).
 - **Confidence:** a drain figure is shown only with at least 1 h of qualifying
   time and at least 3 percentage points of drop. Otherwise it reads
   "not enough data".
 
 **Diagnostics (test builds only).** A Power section shows:
-- the summary above, including the always-open projection
+- the summary above
 - the log's size and its time span
-- **Export:** shares the CSV through the share sheet; when a rotated file
-  exists, both files are shared.
+- **Export:** flushes, then shares immutable snapshot copies of the CSV
+  (both files when a rotated one exists) through the share sheet. The
+  copies are excluded from backup and deleted after sharing completes.
 - **Clear:** deletes the log.
 
 A note says that the app's true share of total battery use is in Settings →
