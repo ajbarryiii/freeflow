@@ -24,16 +24,16 @@ protocol AdjustmentOwner: AnyObject {
     func acknowledgeAsIssued(before: String?, after: String?) -> Bool
     /// `selectionDidChange`: whether it matches an adjustment still owed a callback; consumes nothing.
     func fits(before: String?, after: String?) -> Bool
-    /// When the oldest report a gesture (running or finished) may still send was issued, if any.
-    func oldestOwedReport(now: TimeInterval) -> TimeInterval?
-    /// No gesture runs: a callback is the oldest report the last one may still send. Consumes it.
-    func consumeLateReport(now: TimeInterval) -> Bool
+    /// Only edits made before this may be echoed now (nil: any), while adjustments still owe reports.
+    var echoCutoff: TimeInterval? { get }
+    /// A `textDidChange` that is not an echo of our edits: it pays the oldest report owed.
+    func reportArrived()
 }
 
 extension AdjustmentOwner {
     func acknowledgeAsIssued(before: String?, after: String?) -> Bool { false }
-    func oldestOwedReport(now: TimeInterval) -> TimeInterval? { nil }
-    func consumeLateReport(now: TimeInterval) -> Bool { false }
+    var echoCutoff: TimeInterval? { nil }
+    func reportArrived() {}
 }
 
 /// The editing side's bookkeeping, independent of UIKit (ARCHITECTURE.md, "Undo ownership v2" and
@@ -133,28 +133,27 @@ final class EditingCore {
         // A host that also reported our edits would report that key first; then its own report comes
         // next and is taken below.
         if textChanged, let adjustments, adjustments.isActive, adjustments.acknowledgeAsIssued(before: before, after: after) {
+            adjustments.reportArrived()
             return .own
         }
         // Reports arrive in order: those of our own edits come before those of a gesture begun after
-        // them, and one of them can look like a gesture's outcome (a probe not yet landed). A report a
-        // gesture still owes comes before the echo of any edit made after its adjustment was issued
-        // (ARCHITECTURE.md, "Typing model v2": late gesture reports are never echoes). While it runs, only
-        // edits made before that may be echoed now. Once it has finished, no callback is an echo until
-        // its reports have come: deleting what was typed can bring back the very state an earlier edit
-        // left, and an owed report showing it is no echo of that edit.
-        let owedSince = adjustments?.oldestOwedReport(now: now)
-        let cutoff = adjustments?.isActive == true ? owedSince : owedSince.map { _ in -TimeInterval.infinity }
-        if consumeOwnEdit(Self.state(before: before, after: after), madeBefore: cutoff, now: now) {
+        // them, and one of them can look like a gesture's outcome (a probe not yet landed). A report still
+        // owed for an adjustment comes before the echo of any edit made after it (ARCHITECTURE.md, "Typing
+        // model v2": late gesture reports are never echoes), so while one is owed only edits made before
+        // `echoCutoff` may be echoed now: none while a finished gesture owes reports (an edit made since ends
+        // a gesture, and deleting what was typed can bring back the very state an earlier edit left, so an
+        // owed report showing it is no echo).
+        if consumeOwnEdit(Self.state(before: before, after: after), madeBefore: adjustments?.echoCutoff, now: now) {
             undo.invalidate()
             return .ownEdit
         }
+        if textChanged { adjustments?.reportArrived() }
         if let adjustments, adjustments.isActive,
            textChanged ? adjustments.acknowledge(before: before, after: after) : adjustments.fits(before: before, after: after) {
             return .own
         }
         // Nothing of ours explains it: the undo is gone, and so is anything bound to the document as it
-        // was. A report a finished gesture still owed is no different, but it is no longer awaited.
-        _ = adjustments?.consumeLateReport(now: now)
+        // was. A report a finished gesture still owed is no different (it has been counted above).
         undo.invalidate()
         generation &+= 1
         return .outside

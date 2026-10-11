@@ -1536,3 +1536,34 @@ same duration and conditions, for example overnight.
   - The unit inference ("caret shown inside a cluster means UTF-16") can
     mislearn on a grapheme host after the accepted residual.
   - Device testing of `.keyDown` and v2 typing is pending.
+
+### Keyboard round 11 notes (2026-10-10)
+
+This supersedes the 1 s report retention in the round 10 notes.
+
+- **Exact report debt.** `ReportDebt`, held by the trackpad controller,
+  records every adjustment issued in a field, including rollbacks and
+  repairs. Each owes one host report, or two where the host reports twice
+  or is not yet known to report once. Every non-echo `textDidChange` in the
+  field pays the oldest. A new gesture inherits the debt it is sure of. A
+  report stays owed however late it is: there is no time-based expiry. The
+  ledger is bounded at 64 entries, current field only.
+- **Echo rule.** While a finished gesture still owes reports, nothing is an
+  echo. While a gesture runs, only edits made before its first adjustment
+  can be.
+- **Oracle independence.** At an interruption, the torture oracle takes the
+  field's text from the live proxy window the fake host showed, never from
+  production's landing.
+- **Slow hosts.** Keys around interrupted free gestures are scripted on
+  late-report and late-edit hosts too. Position, count, order and text are
+  checked exactly at each release. Only casing that depends on text never
+  shown is taken from the host.
+- **Pinned accepted risk.** A slow host can leave a jump between the halves
+  of an emoji. A letter typed then lands inside it, and one delete restores
+  the field. Fixtures pin this behavior.
+- **Residual risks:**
+  - An outside change while reports are owed pays one, so the report it
+    displaced counts as outside. That only resets timing.
+  - A field never learned to report once keeps phantom second reports,
+    which only suppress echoes.
+  - Device latency under load is unmeasured.

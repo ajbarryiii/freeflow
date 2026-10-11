@@ -34,14 +34,11 @@ final class TrackpadController: AdjustmentOwner {
     private var touchRate = TouchRateEstimator()
     /// The keyboard hid while a cancelled session still watches a jump; see `hide`.
     private var isHiding = false
-    /// Reports the last session in this field was still owed when it ended (a key ended it at once), by
-    /// issue time: the next session expects them first.
-    private var owedReports: (documentID: UUID, times: [TimeInterval])?
-    /// Every report the last session in this field may still send (`TrackpadSession.lateReports`), by
-    /// issue time, for at most `lateReportLifetime`: none is ever the echo of a later edit.
-    private var lateReports: (documentID: UUID, times: [TimeInterval])?
-    /// How long after it was issued a finished session's adjustment may still be reported.
-    static let lateReportLifetime: TimeInterval = 1
+    /// Every report the host still owes for the adjustments issued in this field, by any session
+    /// (`ReportDebt`): none is the echo of a later edit, and a new session expects them first.
+    private(set) var debt = ReportDebt()
+    /// When the running session began.
+    private var sessionStartedAt: TimeInterval?
     var parameters = TrackpadParameters.standard
     /// The current edit generation, owned by `EditingCore`.
     var currentGeneration: () -> Int = { 0 }
@@ -82,12 +79,12 @@ final class TrackpadController: AdjustmentOwner {
         guard let host, let documentID = host.documentID else { return false }
         self.documentID = documentID
         generation = currentGeneration()
+        sessionStartedAt = lastTimestamp
         let unit = unitCache.flatMap { $0.documentID == documentID ? $0.unit : nil }
         if unit == nil { unitCache = nil }
         let reportsTwice = reportsCache.flatMap { $0.documentID == documentID ? $0.reportsTwice : nil }
         if reportsTwice == nil { reportsCache = nil }
-        let owed = owedReports.flatMap { $0.documentID == documentID ? $0.times : nil } ?? []
-        owedReports = nil
+        let owed = debt.sure(in: documentID)
         touchRate.beginGesture()
         var parameters = self.parameters
         parameters.eventStepScale = touchRate.eventStepScale
@@ -132,7 +129,7 @@ final class TrackpadController: AdjustmentOwner {
         guard isValid else { return finish(completed: false) }
         let rollback = session.cancel(at: timestamp)
         self.session = session
-        if let rollback, rollback != 0 { host?.adjust(by: rollback) }
+        if let rollback { issue(rollback, reportsTwice: session.reportsTwice) }
     }
 
     /// The keyboard is hiding: roll back an outstanding probe now and drop the snapshot (and its
@@ -143,8 +140,6 @@ final class TrackpadController: AdjustmentOwner {
         cancel(at: timestamp)
         unitCache = nil
         reportsCache = nil
-        owedReports = nil
-        lateReports = nil
         if let session, !session.isSettled {
             isHiding = true
             return
@@ -197,7 +192,8 @@ final class TrackpadController: AdjustmentOwner {
         guard isValid, let host else { return finish(completed: false) }
         let offset = session.frame(before: host.contextBefore, after: host.contextAfter, timestamp: timestamp)
         self.session = session
-        if let offset, offset != 0 { host.adjust(by: offset) }
+        if let offset { issue(offset, reportsTwice: session.reportsTwice) }
+        learnReports()
         if !isHiding, let documentID {
             if let unit = session.unit { unitCache = (documentID, unit) }
             if let reportsTwice = session.reportsTwice { reportsCache = (documentID, reportsTwice) }
@@ -207,40 +203,47 @@ final class TrackpadController: AdjustmentOwner {
     }
 
     func acknowledge(before: String?, after: String?) -> Bool {
-        session?.acknowledge(before: before, after: after) ?? false
+        defer { learnReports() }
+        return session?.acknowledge(before: before, after: after) ?? false
     }
 
     func acknowledgeAsIssued(before: String?, after: String?) -> Bool {
-        session?.acknowledgeAsIssued(before: before, after: after) ?? false
+        defer { learnReports() }
+        return session?.acknowledgeAsIssued(before: before, after: after) ?? false
     }
 
     func fits(before: String?, after: String?) -> Bool {
         session?.fits(before: before, after: after) ?? false
     }
 
-    /// When the oldest report a gesture may still send was issued: the running session's, or the last
-    /// finished one's in this field (within `lateReportLifetime`). Reports arrive in order, so an edit
-    /// made after it cannot be echoed before that report has arrived.
-    func oldestOwedReport(now: TimeInterval) -> TimeInterval? {
-        if let session { return session.lateReports.first }
-        guard var late = lateReports, let host, host.documentID == late.documentID else { return nil }
-        late.times.removeAll { now - $0 > Self.lateReportLifetime }
-        lateReports = late.times.isEmpty ? nil : late
-        return late.times.first
+    /// While the field the host serves still owes reports: only edits made before this may be echoed now.
+    /// Reports arrive in order, so the report owed for an adjustment comes before the echo of any edit made
+    /// after it. While a finished gesture still owes some, nothing is an echo: its report can show the
+    /// field unchanged, exactly as the edit made before it left it (`-infinity`). With only the running
+    /// session's own reports owed, edits made before its first adjustment may be.
+    var echoCutoff: TimeInterval? {
+        guard let oldest = debt.oldest(in: host?.documentID) else { return nil }
+        guard session != nil, let started = sessionStartedAt, oldest > started else { return -.infinity }
+        return oldest
     }
 
-    /// No gesture runs, and the last one in this field may still send a report: a callback nothing
-    /// else explains is the oldest of them (ARCHITECTURE.md, "Typing model v2": never an echo). It
-    /// confirms nothing and still counts as an outside change; the next gesture no longer waits for it.
-    func consumeLateReport(now: TimeInterval) -> Bool {
-        guard session == nil, oldestOwedReport(now: now) != nil, var late = lateReports else { return false }
-        late.times.removeFirst()
-        lateReports = late.times.isEmpty ? nil : late
-        if var owed = owedReports, !owed.times.isEmpty {
-            owed.times.removeFirst()
-            owedReports = owed.times.isEmpty ? nil : owed
-        }
-        return true
+    /// A `textDidChange` in the field the host serves that is not an echo of our edits: it pays the oldest
+    /// report owed there.
+    func reportArrived() {
+        debt.paid(in: host?.documentID)
+    }
+
+    /// Issues an adjustment in the session's field and counts the reports the host owes for it.
+    private func issue(_ offset: Int, reportsTwice: Bool?) {
+        guard offset != 0, let host, let documentID else { return }
+        host.adjust(by: offset)
+        debt.issued(at: lastTimestamp, in: documentID, reportsTwice: reportsTwice)
+    }
+
+    /// The session learned whether the field reports each adjustment twice: so does the debt.
+    private func learnReports() {
+        guard let documentID, let reportsTwice = session?.reportsTwice else { return }
+        debt.learned(reportsTwice: reportsTwice, in: documentID)
     }
 
     /// The field and the generation are still the ones the gesture started on. While a hidden keyboard
@@ -252,20 +255,13 @@ final class TrackpadController: AdjustmentOwner {
     }
 
     private func finish(completed: Bool, landing: String? = nil) {
-        guard let session else {
+        guard session != nil else {
             if isHiding { isHiding = false; documentID = nil }
             return
         }
         if isHiding {
             isHiding = false
             documentID = nil
-        }
-        if let documentID, !session.owedReports.isEmpty {
-            owedReports = (documentID, session.owedReports)
-        }
-        if let documentID {
-            let late = session.lateReports
-            lateReports = late.isEmpty ? nil : (documentID, late)
         }
         finishedLanding = landing
         self.session = nil

@@ -72,6 +72,9 @@ enum TrackpadSessionTests {
             ("cancellingReleasesTheLaidOutText", testCancellingReleasesTheLaidOutText),
             ("hidingReleasesTheLaidOutTextOfAWatch", testHidingReleasesTheLaidOutTextOfAWatch),
             ("nextGestureWaitsForReportsStillOwed", testNextGestureWaitsForReportsStillOwed),
+            ("reportDebtCountsEveryCallback", testReportDebtCountsEveryCallback),
+            ("reportsOwedOutliveTheNextGesture", testReportsOwedOutliveTheNextGesture),
+            ("nextGestureInheritsBothWebKitReports", testNextGestureInheritsBothWebKitReports),
         ]
     }
 
@@ -1439,5 +1442,90 @@ extension TrackpadSessionTests {
         }
         TestSupport.expect(document.host.adjustmentCount > 1, "the next gesture never moved")
         TestSupport.expect(document.host.caretIsOnBoundary, "left inside the emoji")
+    }
+
+    fileprivate static func testReportDebtCountsEveryCallback() {
+        // One report per adjustment, two where the host reports each twice or is not known to report once;
+        // learning that it reports once drops the assumed second ones; callbacks pay the oldest first; a
+        // new field starts afresh.
+        let fieldA = UUID(), fieldB = UUID()
+        var debt = ReportDebt()
+        debt.issued(at: 1, in: fieldA, reportsTwice: nil)
+        debt.issued(at: 2, in: fieldA, reportsTwice: nil)
+        TestSupport.expectEqual(debt.owed(in: fieldA), 4)
+        TestSupport.expectEqual(debt.sure(in: fieldA), [1, 2])
+        TestSupport.expect(debt.paid(in: fieldA), "nothing owed")
+        TestSupport.expectEqual(debt.oldest(in: fieldA), 1)
+        debt.learned(reportsTwice: false, in: fieldA)
+        // The first adjustment's one report came; the second still owes one.
+        TestSupport.expectEqual(debt.owed(in: fieldA), 1)
+        TestSupport.expectEqual(debt.oldest(in: fieldA), 2)
+        debt.issued(at: 3, in: fieldA, reportsTwice: true)
+        TestSupport.expectEqual(debt.owed(in: fieldA), 3)
+        TestSupport.expectEqual(debt.sure(in: fieldA), [2, 3, 3])
+        TestSupport.expectEqual(debt.oldest(in: fieldB), nil)
+        TestSupport.expect(!debt.paid(in: fieldB), "another field's callback paid this one's debt")
+        debt.issued(at: 4, in: fieldB, reportsTwice: false)
+        TestSupport.expectEqual(debt.owed(in: fieldA), 0)
+        TestSupport.expectEqual(debt.owed(in: fieldB), 1)
+    }
+
+    fileprivate static func testReportsOwedOutliveTheNextGesture() {
+        // A key ended a gesture with its move's reports still owed, and another gesture began: those reports
+        // are still owed (they come first), so nothing is an echo of our edits until they have come. Once
+        // the field has heard them, only the running gesture's own reports remain.
+        let document = FakeDocument(FakeTextHost(text: "Alpha beta gamma", unit: .utf16, callbackFrames: 4))
+        let controller = TrackpadController(host: document)
+        controller.parameters = .flat
+        controller.begin(layout: FixedWidthLayout(columns: 1_000), linePitch: 20, layoutWidth: 10_000)
+        controller.move(dx: -30, dy: 0, timestamp: 1)
+        controller.tick(at: 1)
+        controller.interrupt(at: 1.001)
+        controller.begin(layout: FixedWidthLayout(columns: 1_000), linePitch: 20, layoutWidth: 10_000)
+        TestSupport.expectEqual(controller.echoCutoff, -TimeInterval.infinity)
+        controller.reportArrived()
+        controller.reportArrived()
+        TestSupport.expectEqual(controller.echoCutoff, nil)
+    }
+
+    fileprivate static func testNextGestureInheritsBothWebKitReports() {
+        // The round-10 review's P2: a gesture begun while the last one still owed reports inherited one per
+        // adjustment. WebKit reports each twice, and the second reached the new gesture as one of its own.
+        // The new gesture inherits every report the field still owes, as the host sends them.
+        var host = FakeTextHost(text: "Alpha beta gamma", unit: .grapheme, callbackFrames: 4)
+        host.reportsAsIssuedFirst = true
+        let document = FakeDocument(host)
+        let controller = TrackpadController(host: document)
+        controller.parameters = .flat
+        var time = 1.0
+        // Each report reaches the controller as `EditingCore` passes it on: owed, then attributed.
+        func frames(_ count: Int) {
+            for _ in 0 ..< count {
+                time += 1.0 / 120
+                document.host.advanceFrame()
+                while let report = document.host.takeCallback() {
+                    controller.reportArrived()
+                    TestSupport.expect(controller.acknowledge(before: report.before, after: report.after), "a report not explained")
+                }
+                controller.tick(at: time)
+            }
+        }
+        // A first gesture teaches the field that it reports each adjustment twice.
+        controller.begin(layout: FixedWidthLayout(columns: 1_000), linePitch: 20, layoutWidth: 10_000)
+        controller.move(dx: -10, dy: 0, timestamp: time)
+        controller.end(at: time)
+        frames(90)
+        TestSupport.expect(!controller.isActive, "the first gesture never settled")
+        TestSupport.expectEqual(document.host.caret, 15)
+        // A key ends the next one with its move still to report twice, and another begins at once.
+        controller.begin(layout: FixedWidthLayout(columns: 1_000), linePitch: 20, layoutWidth: 10_000)
+        controller.move(dx: -30, dy: 0, timestamp: time)
+        frames(1)
+        controller.interrupt(at: time)
+        controller.begin(layout: FixedWidthLayout(columns: 1_000), linePitch: 20, layoutWidth: 10_000)
+        controller.move(dx: -20, dy: 0, timestamp: time)
+        controller.end(at: time)
+        frames(120)
+        TestSupport.expectEqual(document.host.caret, 10)
     }
 }

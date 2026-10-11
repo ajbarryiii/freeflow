@@ -169,9 +169,6 @@ struct TrackpadSession {
     private var leftovers: [TimeInterval] = []
     /// Reports an earlier gesture in this field was still owed when this one began, by issue time.
     private var inherited: [TimeInterval] = []
-    /// Reports retired as overdue, by issue time (at most 16): a host may still send them, and none of
-    /// them is then the echo of a later edit (`lateReports`). Holds no text.
-    private var retiredReports: [TimeInterval] = []
     /// One of them arrived: the snapshot is taken again from the context it shows.
     private var resnapshotFromReport = false
     /// Whether the host reports each adjustment twice, first as issued (WebKit), or once (UIKit); nil
@@ -200,8 +197,8 @@ struct TrackpadSession {
     private var lastIssuedAt: TimeInterval?
 
     /// `reportsTwice`: how the host reports adjustments, if an earlier gesture in this field learned it.
-    /// `owedReports`: when the adjustments of an earlier gesture whose reports have not arrived yet were
-    /// issued (`owedReports` of that session); they come before this gesture's own.
+    /// `owedReports`: the reports the field surely still owes for earlier adjustments, by issue time
+    /// (`TrackpadController`, `ReportDebt`); they come before this gesture's own.
     init(before: String?, after: String?, unit: CursorOffsetUnit?, reportsTwice: Bool? = nil,
          owedReports: [TimeInterval] = [], parameters: TrackpadParameters, layout: any LineLayout,
          linePitch: Double, layoutWidth: Double) {
@@ -229,25 +226,6 @@ struct TrackpadSession {
         // moves until its reports show the field as it is (or their time is up).
         inherited = owedReports
         unconfirmedAdjustments = owedReports.count
-    }
-
-    /// When the adjustments whose reports have not arrived yet were issued, oldest first: the next
-    /// gesture in this field expects them before its own.
-    var owedReports: [TimeInterval] {
-        guard !isCancelled else { return [] }
-        return inherited + leftovers + pending.map(\.issuedAt)
-    }
-
-    /// Every report the host may still send for this gesture, by issue time, oldest first: as
-    /// `owedReports`, but both reports of an adjustment a host that reports twice (WebKit, or one not
-    /// known to report once) has not reported yet, a cancelled session's rollback and repairs, and
-    /// reports retired as overdue, which may still come. None of them is ever the echo of a later edit
-    /// (ARCHITECTURE.md, "Typing model v2").
-    var lateReports: [TimeInterval] {
-        let owed = isCancelled
-            ? lastIssuedAt.map { Array(repeating: $0, count: unconfirmedAdjustments) } ?? []
-            : inherited + leftovers + Self.reportTimes(pending, twice: reportsTwice != false)
-        return (retiredReports + owed).sorted()
     }
 
     /// Nothing is in flight, and the caret is at the target or can get no closer for now.
@@ -599,10 +577,8 @@ struct TrackpadSession {
     /// issued, though its outcome was a move elsewhere, leaves the caret unknown: ambiguous.
     private mutating func retireOverdue(at timestamp: TimeInterval) {
         let late = leftovers.prefix { timestamp - $0 > parameters.syncTimeout }.count
-        noteRetired(Array(leftovers.prefix(late)))
         leftovers.removeFirst(late)
         let lateInherited = inherited.prefix { timestamp - $0 > parameters.syncTimeout }.count
-        noteRetired(Array(inherited.prefix(lateInherited)))
         inherited.removeFirst(lateInherited)
         // The last of them will not come: the field as the proxy shows it now is all there is.
         if lateInherited > 0, inherited.isEmpty { resnapshotFromReport = true }
@@ -611,25 +587,12 @@ struct TrackpadSession {
         if overdue > 0 { retire(overdue) }
     }
 
-    private mutating func noteRetired(_ times: [TimeInterval]) {
-        retiredReports += times
-        if retiredReports.count > 16 { retiredReports.removeFirst(retiredReports.count - 16) }
-    }
-
-    /// The reports these adjustments may still send: two for one a host that reports twice has not
-    /// reported yet as issued.
-    private static func reportTimes<Entries: Sequence>(_ entries: Entries, twice: Bool) -> [TimeInterval]
-        where Entries.Element == Pending {
-        entries.flatMap { twice && !$0.reportedAsIssued ? [$0.issuedAt, $0.issuedAt] : [$0.issuedAt] }
-    }
-
     /// Retires the `count` oldest expectations.
     private mutating func retire(_ count: Int) {
         for entry in pending.prefix(count) where entry.reportedAsIssued && !Self.fits(entry.issuedIn, entry.outcomes) {
             isAmbiguous = true
         }
         if let suspended = suspendedFor, pending.prefix(count).contains(where: { $0.id == suspended }) { suspendedFor = nil }
-        noteRetired(Self.reportTimes(pending.prefix(count), twice: reportsTwice != false))
         pending.removeFirst(count)
         unconfirmedAdjustments = max(0, unconfirmedAdjustments - count)
     }

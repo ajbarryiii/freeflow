@@ -102,6 +102,12 @@ private enum OracleRules {
         }
     }
 
+    /// Whether the shift after `typed` is the same whatever text comes before it.
+    static func decides(_ typed: String, mode: AutocapitalizationMode) -> Bool {
+        let first = capitalizes(after: typed, mode: mode)
+        return ["a", "a ", "a. ", "a.\n", "\n", " "].allSatisfy { capitalizes(after: $0 + typed, mode: mode) == first }
+    }
+
     /// Whether a second space replaces the first with ". ": it follows a letter, a digit or a closing
     /// quote or bracket.
     static func periodReplaces(spaceAfter before: String) -> Bool {
@@ -284,6 +290,14 @@ private final class TortureWorld {
     /// From a key ending a free gesture until the first edit: the text before the caret as the keyboard
     /// reads it then (the landing, or the proxy's reading), which Shift and layer keys before that edit see.
     private var interruptContext: String?
+    /// The spans of the field the proxy showed as they are during the current gesture (`FakeTextHost
+    /// .liveWindow`), oldest first: what the keyboard could have read, observed without asking it.
+    private var windowsSeen: [Range<Int>] = []
+    /// While the keys after a free gesture on a slow host run (reports after `syncTimeout`, or edits shown
+    /// late): the field's text before this offset (the first key's insertion point, or where deletions
+    /// since reached) may never have been shown as it is. A letter whose case depends on it is taken from
+    /// the host; where the keys act, and that each acts once, in order, is still checked exactly.
+    private var slowBase: Int?
 
     private func note(_ event: String) {
         var line = String(format: "%.3f ", time - 100) + event
@@ -341,10 +355,11 @@ private final class TortureWorld {
         harness.onDeliver = { [unowned self] gestureRunning in
             if !gestureRunning { self.freeDeliveries += 1 }
         }
-        if tracing {
-            harness.onFrame = { [unowned self] in
-                guard self.inGesture else { return }
-                let host = self.harness.document.host
+        harness.onFrame = { [unowned self] in
+            guard self.inGesture else { return }
+            let host = self.harness.document.host
+            if let window = host.liveWindow, self.windowsSeen.last != window { self.windowsSeen.append(window) }
+            if self.tracing {
                 self.note("frame: trackpad \(self.harness.trackpad.isActive ? "on" : "off") unit \(self.harness.trackpad.session?.unit.map { "\($0)" } ?? "-"), caret \(host.caret), proxy "
                     + "\(String((self.harness.document.contextBefore ?? "").suffix(8)).debugDescription), \(host.traceDescription), "
                     + "outcomes \(self.harness.outcomes.suffix(2))")
@@ -526,6 +541,7 @@ private final class TortureWorld {
         bindings[id] = Held(action: action, role: role, field: current, x: point.x, y: point.y)
         switch action {
         case .shift:
+            note("key down shift (keyboard: \(harness.editor.typing.shift), oracle before: \(typing.shift))")
             typing.tapShift(at: time)
         case .layer(let layer):
             typing.switchLayer(layer)
@@ -596,10 +612,26 @@ private final class TortureWorld {
         note("key \(action) bound \(name(binding)) in \(name(current)) shift \(typing.shift) (keyboard: \(harness.editor.typing.shift)) layer \(typing.layer)")
         if let bound = binding, let field = current, bound != field { return }
         if current != keyboardField { fieldChanged() }
+        // On a slow host, the case of a letter typed where the shift depends on text never shown as it is
+        // comes from the host (before the first edit, or while what was typed since does not decide it).
+        let caseUnknown = slowBase.map { base in
+            interruptContext != nil || !OracleRules.decides(String(decoding: fields[shown]!.units[min(base, fields[shown]!.caret) ..< fields[shown]!.caret], as: UTF16.self), mode: modes[shown]!)
+        } ?? false
         let edit = typing.resolve(action, before: fields[shown]!.before, at: time)
         fields[shown]!.apply(deletes: edit.deletes, text: edit.text)
+        if caseUnknown, case .character = action, edit.text.lowercased() != edit.text.uppercased() {
+            let caret = fields[shown]!.caret, length = edit.text.utf16.count
+            let host = harness.document.host.units
+            if caret <= host.count, caret >= length {
+                let typed = String(decoding: host[(caret - length) ..< caret], as: UTF16.self)
+                if typed.lowercased() == edit.text.lowercased() {
+                    fields[shown]!.units.replaceSubrange((caret - length) ..< caret, with: Array(typed.utf16))
+                }
+            }
+        }
         if edit.deletes > 0 || !edit.text.isEmpty { interruptContext = nil }
         if let offset = unknown, edit.deletes > 0 { unknown = min(offset, fields[shown]!.caret) }
+        if let base = slowBase, edit.deletes > 0 { slowBase = min(base, fields[shown]!.caret) }
         update()
     }
 
@@ -677,19 +709,19 @@ private final class TortureWorld {
         // the gesture too), an outside change, hiding, or nothing. Never a space: what follows a gesture
         // starts its space timing anew.
         enum Around { case nothing, keys(Int), outside, hide }
-        // Keys follow a free gesture only on a host whose behavior leaves them knowable. A host whose
-        // reports come after `syncTimeout` is outside the trackpad's guarantees (a probe resolved by timeout
-        // may learn the wrong unit, so where a move lands is not known). On a host that shows our edits
-        // late, after a key abandons a probe nothing shows the text before the insertion point until the
-        // proxy catches up, so keys typed in that instant cannot be cased from it.
+        // A slow host: its reports come after `syncTimeout`, outside the trackpad's guarantees (a probe
+        // resolved by timeout may learn the wrong unit, so where a move lands is not known), or it shows our
+        // edits late (after a key abandons a probe nothing shows the text before the insertion point until
+        // the proxy catches up). Keys follow free gestures there too; only the case of a letter that depends
+        // on text the keyboard cannot have read is taken from the host (`slowBase`).
         let reporting = harness.document.host
         let reportsInTime = reporting.callbackFrames.map {
             Double($0 + reporting.lagFrames) / 120 < TrackpadParameters.standard.syncTimeout
         } ?? true
-        let knowable = reportsInTime && reporting.editContextLagFrames == 0
+        let slow = !predictable && (!reportsInTime || reporting.editContextLagFrames > 0)
         let around: Around
         switch random.below(10) {
-        case 0 ..< 4: around = predictable || knowable ? .keys(1 + random.below(4)) : .nothing
+        case 0 ..< 4: around = .keys(1 + random.below(4))
         case 4: around = predictable ? .nothing : .outside
         case 5: around = predictable ? .nothing : .hide
         default: around = .nothing
@@ -702,6 +734,7 @@ private final class TortureWorld {
         // A key typed into an earlier gesture may have left the caret inside a cluster (the accepted
         // residual); a gesture that never moves does not repair that.
         let startedOnBoundary = harness.document.host.caretIsOnBoundary
+        windowsSeen = harness.document.host.liveWindow.map { [$0] } ?? []
         let finger = harness.beginGesture()
         typing.resetTiming()
         let events = predictable ? 1 : 1 + random.below(4)
@@ -731,12 +764,14 @@ private final class TortureWorld {
             } else {
                 harness.frames(random.below(8))
                 placeAtInterruption(field)
+                if slow { slowBase = fields[field]!.caret }
             }
             for _ in 0 ..< count {
-                touchUp(touchDown(gestureKey()))
+                touchUp(touchDown(gestureKey(shift: !slow)))
             }
             unknown = nil
             interruptContext = nil
+            slowBase = nil
             // Every report of the gesture a key ended arrives with no gesture running: a callback that is
             // not an echo, which starts the timing over (ARCHITECTURE.md, "Typing model v2").
             let deliveries = freeDeliveries
@@ -778,15 +813,16 @@ private final class TortureWorld {
         return nil
     }
 
-    /// A key typed around a gesture: a character or Return from the layer shown, delete, Shift, or a
+    /// A key typed around a gesture: a character or Return from the layer shown, delete, Shift (unless
+    /// `shift` is false: on a slow host what it leaves the shift at may depend on text never shown), or a
     /// layer key.
-    private func gestureKey() -> KeyAction {
+    private func gestureKey(shift: Bool = true) -> KeyAction {
         switch random.below(10) {
         case 0, 1: return .delete
         case 2:
             let switches = keys { action in
                 if case .layer = action { return true }
-                return action == .shift
+                return shift && action == .shift
             }
             return switches.isEmpty ? .delete : random.pick(switches)
         default: return random.pick(typedKeys(space: false))
@@ -796,33 +832,31 @@ private final class TortureWorld {
     /// The first key after a free gesture's lift ends it at its touch-down (ARCHITECTURE.md, "Typing
     /// model v2"). Only where the keys act comes from the host: the caret once what the gesture already
     /// issued has landed (observed on a copy, so nothing lands early). The shift follows the text the
-    /// keyboard can read there: where the gesture's last move lands (the field's own text before that
-    /// caret), or, with a probe or a jump out whose outcome is abandoned (or the gesture already over),
-    /// the proxy's context. Every key from here on is checked exactly, case included (`unknown`
-    /// states the one limit).
+    /// keyboard can read there, derived here without asking it: with the gesture's last move landing on a
+    /// boundary, the field's own text before that caret within the window the proxy showed as it is around
+    /// it (`windowsSeen`); with a probe or a jump out whose outcome is abandoned (or the gesture already
+    /// over), the proxy's context. Every key from here on is checked exactly, case included (`unknown` and
+    /// `slowBase` state the limits). Only whether the keyboard has a landing at all is read from it.
     private func placeAtInterruption(_ field: UUID) {
         let session = harness.trackpad.session
         let caret = harness.document.host.caretOnceAdjusted
         fields[field]!.caret = caret
         typing.resetTiming()
-        if session != nil, let landing = session?.landingBefore {
-            // The landing is the window of the field's own text the proxy showed before that caret, unless
-            // the gesture lost track of where the host put it (WebKit's double reports with provisional
-            // answers and lag; a gesture that began inside a cluster): then the keyboard has seen none of
-            // the text before the caret, and the proxy, which shows the field on a host where keys follow a
-            // free gesture, decides once something is typed.
-            let seen = fields[field]!.before.hasSuffix(landing)
-            if !seen { note("the gesture's landing \(landing.debugDescription) is not where the host put the caret") }
-            unknown = seen ? caret - landing.utf16.count : caret
-            interruptContext = landing
-            typing.update(OracleRules.capitalizes(after: landing, mode: modes[field]!))
+        if session?.landingBefore != nil {
+            // The window the proxy showed around the caret: the first one (the gesture's snapshot) if it
+            // covers it, else the latest that does. None does: the field's own text decides the first key,
+            // and the proxy what follows once deletions reach before the caret.
+            let window = windowsSeen.first.flatMap { $0.contains(caret) || $0.upperBound == caret ? $0 : nil }
+                ?? windowsSeen.last { $0.contains(caret) || $0.upperBound == caret }
+            unknown = window?.lowerBound ?? caret
+            interruptContext = String(decoding: fields[field]!.units[(window?.lowerBound ?? 0) ..< caret], as: UTF16.self)
         } else {
             // A probe or a jump abandoned: the proxy's reading. Only a key that ends a running gesture
             // abandons an outcome; one that settled left the proxy showing where it put the caret.
             unknown = session != nil ? caret : nil
             interruptContext = harness.document.contextBefore ?? ""
-            typing.update(OracleRules.capitalizes(after: interruptContext!, mode: modes[field]!))
         }
+        typing.update(OracleRules.capitalizes(after: interruptContext!, mode: modes[field]!))
         note("placed at \(caret), shift from the \(session?.landingBefore != nil ? "landing" : "proxy")")
     }
 

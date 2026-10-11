@@ -291,6 +291,14 @@ struct FakeTextHost {
         return liveContext
     }
 
+    /// The span of the field (UTF-16 offsets) the proxy shows now, when it shows the field as it is: not a
+    /// provisional answer, a report's caret, or a view our edits have not reached yet.
+    var liveWindow: Range<Int>? {
+        guard provisional == nil, shownAsIssued == nil, staleContext == nil else { return nil }
+        let shown = liveContext
+        return (caret - shown.before.utf16.count) ..< (caret + selectionLength + shown.after.utf16.count)
+    }
+
     /// The context as the field is now. With a selection, the context before ends at its start and the
     /// one after begins at its end.
     var liveContext: (before: String, after: String) {
