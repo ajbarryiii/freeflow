@@ -99,9 +99,10 @@ final class PowerRecorder {
         store?.isCurrent(generation: status.generation) ?? false
     }
 
-    /// Flushed, immutable copies for the share sheet; pass them to `discard` when sharing completes.
-    func exportSnapshot() async -> PowerLogStore.Export? {
-        guard let store else { return nil }
+    /// Complete, immutable copies for the share sheet (disk plus buffer); pass them to `discard` when
+    /// sharing completes. Removing copies twice is harmless.
+    func exportSnapshot() async -> PowerLogStore.ExportOutcome {
+        guard let store else { return .failed }
         let directory = exportDirectory
         return await withCheckedContinuation { continuation in
             store.exportSnapshot(into: directory) { continuation.resume(returning: $0) }
@@ -112,8 +113,12 @@ final class PowerRecorder {
         store?.removeExport(export)
     }
 
-    func clear() {
-        store?.clear()
+    /// False when the log could not be deleted; it is then kept as it was.
+    func clear() async -> Bool {
+        guard let store else { return false }
+        return await withCheckedContinuation { continuation in
+            store.clear { continuation.resume(returning: $0) }
+        }
     }
 
     // MARK: Private

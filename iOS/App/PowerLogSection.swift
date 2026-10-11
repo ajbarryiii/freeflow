@@ -6,7 +6,11 @@ import UIKit
 /// (never a projection), per-state totals, the log's size and span, Export and Clear.
 struct PowerLogSection: View {
     @State private var status: PowerRecorder.Status?
+    /// The share sheet's binding; SwiftUI may clear it before any cleanup runs.
     @State private var export: PowerLogStore.Export?
+    /// The copies on screen, kept apart from the binding so they are always deleted.
+    @State private var presented: PowerLogStore.Export?
+    @State private var message: String?
     @State private var exporting = false
     @State private var confirmingClear = false
 
@@ -47,10 +51,21 @@ struct PowerLogSection: View {
             } else {
                 ProgressView()
             }
+            if let message {
+                Text(message).foregroundStyle(.red)
+                    .accessibilityIdentifier("diagnostics.power.message")
+            }
             Button("Export log") {
                 exporting = true
                 Task {
-                    export = await PowerRecorder.shared.exportSnapshot()
+                    switch await PowerRecorder.shared.exportSnapshot() {
+                    case .exported(let copies):
+                        message = nil
+                        presented = copies
+                        export = copies
+                    case .empty: message = "Nothing logged yet"
+                    case .failed: message = "Couldn't export the log"
+                    }
                     exporting = false
                     await reload()
                 }
@@ -65,14 +80,20 @@ struct PowerLogSection: View {
             Text("Battery level, charging, thermal state, Low Power Mode, CPU time and memory, sampled each minute and at every change while LocalFlow runs; never audio or text. Stored on this iPhone only. Rates need at least 1 h and 3 % of drop, unplugged. LocalFlow's true share of total battery use is in Settings → Battery, which apps cannot read.")
         }
         .task { await reload() }
-        .sheet(item: $export, onDismiss: discardExport) { export in
-            ActivityView(items: export.files) { discardExport() }
+        .sheet(item: $export, onDismiss: { finishSharing() }) { copies in
+            ActivityView(items: copies.files) { finishSharing(copies) }
         }
         .confirmationDialog("Delete the power log?", isPresented: $confirmingClear, titleVisibility: .visible) {
             Button("Delete", role: .destructive) {
-                PowerRecorder.shared.clear()
-                status = nil
-                Task { await reload() }
+                Task {
+                    if await PowerRecorder.shared.clear() {
+                        message = nil
+                        status = nil
+                    } else {
+                        message = "Couldn't clear the log"
+                    }
+                    await reload()
+                }
             }
         }
     }
@@ -83,11 +104,14 @@ struct PowerLogSection: View {
         status = latest
     }
 
-    /// The copies are deleted when sharing completes or the sheet goes away (and at the next launch).
-    private func discardExport() {
-        guard let current = export else { return }
+    /// Runs on share completion and on dismissal, whichever comes first, and again for the other: the
+    /// copies it was handed and the ones recorded as presented are deleted (deleting twice is harmless).
+    /// Copies left by a crash are deleted at the next launch.
+    private func finishSharing(_ copies: PowerLogStore.Export? = nil) {
+        if let copies { PowerRecorder.shared.discard(copies) }
+        if let presented, presented != copies { PowerRecorder.shared.discard(presented) }
+        presented = nil
         export = nil
-        PowerRecorder.shared.discard(current)
     }
 
     private func stateLabel(_ state: PowerHostState) -> String {

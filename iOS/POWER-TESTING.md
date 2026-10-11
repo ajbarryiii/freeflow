@@ -36,6 +36,11 @@ nm iOS/build/device/obj/LocalFlow | grep -c PowerRecorder   # > 0 power build, 0
 
 In a power build, Diagnostics has a **Power (test build)** section.
 
+Only `POWER_LOG` selects the recorder. `SWIFT_FLAGS="-D LOCALFLOW_POWER_LOG"`
+bypasses the gate (it would also reach the keyboard's compile) and must never
+be used. `make binaries` only compiles and does not repackage an existing
+`.app`, so use `all` for any build that gets installed or published.
+
 ## Collect
 
 The phone records whenever LocalFlow runs, so daily use already produces data,

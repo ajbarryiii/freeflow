@@ -126,6 +126,9 @@ binaries: $(APP_BINARY) $(KEYBOARD_BINARY)
 # Rebuild when identifiers, flags, signing inputs or source lists change.
 CONFIGURATION = $(PLATFORM)|$(BUNDLE_ID)|$(APP_GROUP)|$(URL_SCHEME)|$(DISPLAY_NAME)|$(DEPLOYMENT_TARGET)|$(SDK_PATH)|$(SWIFT_OPTIMIZATION)|$(SWIFT_FLAGS)|$(CODESIGN_IDENTITY)|$(TEAM_ID)|$(APP_PROFILE)|$(KEYBOARD_PROFILE)|$(ICON_SOURCE)|POWER_LOG=$(POWER_LOG)|$(APP_SOURCES)|$(KEYBOARD_SOURCES)
 configuration: $(CONFIG_STAMP)
+# Written while the Makefile is read (below); the empty rule lets a dry run in a
+# fresh directory proceed without it.
+$(CONFIG_STAMP): ;
 
 # Checked while this Makefile is read, before make looks at any file's time:
 # make 3.81 (macOS) caches times and compares whole seconds, so neither a newer
@@ -133,14 +136,32 @@ configuration: $(CONFIG_STAMP)
 # configuration deletes everything built from it (binaries, entitlements, the
 # bundle signature) and then writes the stamp, so a POWER_LOG=0 build can never
 # keep a POWER_LOG=1 binary, however close together the two builds run.
+#
+# Values reach the shell single-quoted (shell_quote), so quotes, backticks and
+# `$` in SWIFT_FLAGS or paths are recorded literally and never run. A dry run
+# (-n), question (-q) or touch (-t), also when inherited by a sub-make, only
+# compares: make 3.81 puts those letters in MAKEFLAGS words that are neither
+# long options (--no-print-directory) nor assignments.
+shell_quote = '$(subst ','\'',$(1))'
+MAKE_FLAG_LETTERS := $(subst -,,$(filter-out --%,$(foreach word,$(MAKEFLAGS),$(if $(findstring =,$(word)),,$(word)))))
+MAKE_CHANGES_NOTHING := $(findstring n,$(MAKE_FLAG_LETTERS))$(findstring q,$(MAKE_FLAG_LETTERS))$(findstring t,$(MAKE_FLAG_LETTERS))
 NO_BUILD_GOALS = check typecheck test lint clean smoke-sim smoke-device e2e-sim e2e-sim-probe e2e-sim-scenarios
 ifneq ($(filter-out $(NO_BUILD_GOALS),$(or $(MAKECMDGOALS),all)),)
-CONFIG_CHECK := $(shell mkdir -p "$(OBJ_DIR)" && printf '%s\n' "$(CONFIGURATION)" > "$(CONFIG_STAMP).tmp" && \
-	if cmp -s "$(CONFIG_STAMP).tmp" "$(CONFIG_STAMP)"; then rm -f "$(CONFIG_STAMP).tmp"; \
-	else rm -f "$(APP_BINARY)" "$(KEYBOARD_BINARY)" "$(APP_ENTITLEMENTS)" "$(KEYBOARD_ENTITLEMENTS)" "$(APP_SIGNATURE)" && \
-	mv "$(CONFIG_STAMP).tmp" "$(CONFIG_STAMP)"; fi >/dev/null 2>&1 || echo failed)
+ifeq ($(MAKE_CHANGES_NOTHING),)
+CONFIG_CHECK := $(shell mkdir -p $(call shell_quote,$(OBJ_DIR)) && \
+	printf '%s\n' $(call shell_quote,$(CONFIGURATION)) > $(call shell_quote,$(CONFIG_STAMP).tmp) && \
+	if cmp -s $(call shell_quote,$(CONFIG_STAMP).tmp) $(call shell_quote,$(CONFIG_STAMP)); then \
+	rm -f $(call shell_quote,$(CONFIG_STAMP).tmp); \
+	else rm -f $(foreach file,$(APP_BINARY) $(KEYBOARD_BINARY) $(APP_ENTITLEMENTS) $(KEYBOARD_ENTITLEMENTS) $(APP_SIGNATURE),$(call shell_quote,$(file))) && \
+	mv $(call shell_quote,$(CONFIG_STAMP).tmp) $(call shell_quote,$(CONFIG_STAMP)); fi >/dev/null 2>&1 || echo failed)
 ifneq ($(CONFIG_CHECK),)
 $(error Cannot update $(CONFIG_STAMP))
+endif
+else
+CONFIG_CHECK := $(shell printf '%s\n' $(call shell_quote,$(CONFIGURATION)) | cmp -s - $(call shell_quote,$(CONFIG_STAMP)) || echo changed)
+ifneq ($(CONFIG_CHECK),)
+$(info Configuration changed: a real build rebuilds everything; this run changes nothing.)
+endif
 endif
 endif
 
