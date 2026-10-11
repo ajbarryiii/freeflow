@@ -1402,3 +1402,64 @@ with `xcrun devicectl device copy from --domain-type appDataContainer`.
     once-per-context repair rule without the in-flight check (same class,
     not hit by any seed).
   - Device testing of v2 typing is pending.
+
+### Always-on microphone test mode (power test builds only; user decision 2026-10-10)
+
+**Purpose.** Measure what an always-open microphone really costs, including
+locked, screen-off hours. Normal sessions end at lock and on idle expiry, so
+the power log alone cannot observe this.
+
+**Gate.**
+- **Where it exists:** only in `POWER_LOG=1` builds, behind the same
+  `LOCALFLOW_POWER_LOG` condition. Production builds have no toggle and no way
+  to enable it.
+- **The host core:** HostSessionCore takes an `alwaysOn` option that defaults
+  to off. Only gated code sets it. Tests cover it in every `make check`.
+- **The keyboard:** unchanged.
+
+**Control.**
+- **The toggle:** Diagnostics → Power has a switch, "Always-on microphone
+  (test)", off by default. Its state persists in the app's own UserDefaults,
+  never the App Group.
+- **The banner:** while the mode is on, Home shows "Always-on test mode: the
+  microphone stays open, even when locked" with a "Turn off" button.
+
+**Behavior while on.**
+- **Idle expiry:** disabled.
+- **Device lock:** it no longer ends the session. An in-progress dictation is
+  still cancelled at lock exactly as today: intents and results are class A
+  and unavailable while locked. The session, the audio session and the
+  engine keep running. Buffers are dropped in the tap, as between dictations.
+- **Unlock:** dictation continues instantly. Nothing about the session
+  restarts.
+- **Other end reasons:** unchanged. These are an interruption, an
+  unrecoverable engine failure, and the user's End session. The mode never
+  starts a session in the background. The next session started in the
+  foreground is always-on again.
+- **Turning it off:** applies at once. Idle expiry counts from the moment the
+  mode is turned off. If the device is locked by then, the session ends at the
+  next lock.
+- **Retention:** no new audio is kept. The rule that drops buffers between
+  dictations is unchanged. iOS shows its microphone indicator throughout,
+  including on the lock screen.
+- **Status heartbeat:** it continues while locked. `status.json` is class C, so
+  it is writable after first unlock. This is part of the cost being measured.
+
+**Power log, schema 2.** Two columns are added after the existing ones:
+- `always_on`: `true` or `false`, the mode at sample time
+- `protected_data`: `available` or `unavailable`, from
+  `UIApplication.isProtectedDataAvailable`. "Unavailable" means locked (a
+  proxy for screen off).
+
+Samples are also taken on protected-data notifications. Readers must accept
+schema 1 files. The summary adds an observed drain rate for `micOpen` while
+locked with always-on. It is labelled like the other observed rates, with no
+automatic projection. The matched comparison is in `POWER-TESTING.md`: an
+always-on run while locked against a no-session run while locked, with the
+same duration and conditions, for example overnight.
+
+**Risks accepted for the test.**
+- **Jetsam:** iOS may still terminate the backgrounded app for memory, since
+  the model stays loaded. The power log shows this as a gap or a `terminate`
+  row.
+- **Battery cost to the user:** this cost is the point of the test.
