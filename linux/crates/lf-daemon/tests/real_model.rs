@@ -104,6 +104,10 @@ fn dictates_librispeech_with_the_real_model() {
             t.elapsed()
         );
         expected_all += &expected.output;
+        // A space follows a finished sentence, before the next dictation.
+        if expected.output.ends_with(['.', '!', '?']) {
+            expected_all.push(' ');
+        }
         assert_eq!(rig.output.text(), expected_all, "{id}");
     }
     let history = lf_daemon::history::History::open(&common::data_dir(&rig.dir)).unwrap();

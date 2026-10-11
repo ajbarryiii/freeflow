@@ -69,8 +69,26 @@ fn voice_macros_and_disabled_history() {
     rig.cmd("toggle");
     rig.cmd("toggle");
     rig.wait_for("state=idle");
-    assert_eq!(rig.output.text(), "Synthetic regards.");
+    assert_eq!(rig.output.text(), "Synthetic regards. ");
     assert!(!common::data_dir(&rig.dir).exists());
+}
+
+#[test]
+fn consecutive_dictations_are_separated_after_a_sentence() {
+    let rec = FakeRecognizer::returning("Synthetic first part.");
+    let rig = Rig::start("resume", speech(), factory(rec.clone()), settings(), false);
+    rig.wait_for("model=ready");
+    rig.cmd("toggle");
+    rig.cmd("toggle");
+    rig.wait_for("state=idle");
+    rec.state().text = Some("Synthetic second part".into());
+    rig.cmd("toggle");
+    rig.cmd("toggle");
+    rig.wait_for("state=idle");
+    assert_eq!(
+        rig.output.text(),
+        "Synthetic first part. Synthetic second part"
+    );
 }
 
 #[test]
@@ -197,7 +215,7 @@ fn short_recordings_capture_errors_and_failures() {
     rig.cmd("press");
     rig.cmd("release");
     rig.wait_for("state=idle");
-    assert_eq!(rig.output.text(), "Synthetic.");
+    assert_eq!(rig.output.text(), "Synthetic. ");
 }
 
 #[test]
@@ -252,7 +270,7 @@ fn records_while_the_model_loads() {
         assert!(Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert_eq!(output.text(), "Synthetic late.");
+    assert_eq!(output.text(), "Synthetic late. ");
     // The watcher saw the model become ready while the dictation waited.
     let lines = watcher.until("state=idle model=ready");
     assert!(
@@ -560,7 +578,7 @@ fn media_pauses_while_recording_and_resumes_after() {
     assert_eq!(rig.cmd("release"), "state=transcribing model=ready");
     wait_until("resume", || players.status_of(PLAYER) == Some(Playing));
     rig.wait_for("state=idle");
-    assert_eq!(rig.output.text(), "Synthetic.");
+    assert_eq!(rig.output.text(), "Synthetic. ");
     // The player the user had paused was never touched.
     assert_eq!(players.calls(MediaCall::Pause, OTHER), 0);
     assert_eq!(players.calls(MediaCall::Play, OTHER), 0);
@@ -608,7 +626,7 @@ fn slow_or_missing_media_players_do_not_delay_recording() {
     );
     assert_eq!(rig.cmd("toggle"), "state=transcribing model=ready");
     rig.wait_for("state=idle");
-    assert_eq!(rig.output.text(), "Synthetic.");
+    assert_eq!(rig.output.text(), "Synthetic. ");
 
     // No session bus: dictation works.
     let players = FakePlayers::default();
@@ -621,7 +639,7 @@ fn slow_or_missing_media_players_do_not_delay_recording() {
     rig.cmd("toggle");
     rig.cmd("toggle");
     rig.wait_for("state=idle");
-    assert_eq!(rig.output.text(), "Synthetic.");
+    assert_eq!(rig.output.text(), "Synthetic. ");
 }
 
 /// `Server::bind` right after a daemon stopped. Other tests fork
@@ -685,7 +703,7 @@ fn a_watcher_follows_a_dictation() {
     );
     // Watch lines carry no text; command replies are unchanged.
     assert!(lines.iter().all(|l| !l.contains("Synthetic")));
-    assert_eq!(rig.output.text(), "Synthetic watched words.");
+    assert_eq!(rig.output.text(), "Synthetic watched words. ");
     assert_eq!(rig.cmd("status"), "state=idle model=ready");
 }
 

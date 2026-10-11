@@ -2,6 +2,7 @@
 //! output, and runs jobs in order. The control loop never waits for it,
 //! except for at most one output call when it cancels (see [`CancelToken`]).
 
+use std::borrow::Cow;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
@@ -248,7 +249,8 @@ fn run(
         return Outcome::OutputFailed;
     }
     events(WorkerEvent::Typing(job.id));
-    for piece in chunks(&text, settings.type_chunk_chars) {
+    let typed = with_sentence_space(&text, enter);
+    for piece in chunks(&typed, settings.type_chunk_chars) {
         match cancel.run(|| output.type_text(piece)) {
             None => return Outcome::Cancelled,
             Some(Err(e)) => {
@@ -273,6 +275,17 @@ fn run(
         text,
         pressed_enter: enter,
         retype,
+    }
+}
+
+/// The text to type: a space follows sentence-ending punctuation so the next
+/// dictation does not jam against it (as in the Swift app). Not before
+/// Return, which ends the line anyway.
+fn with_sentence_space(text: &str, enter: bool) -> Cow<'_, str> {
+    if !enter && text.ends_with(['.', '!', '?']) {
+        Cow::Owned(format!("{text} "))
+    } else {
+        Cow::Borrowed(text)
     }
 }
 
@@ -361,6 +374,61 @@ mod tests {
         let outcome = run(job, &mut rec, &mut out.clone(), &settings, &|_| {});
         assert_eq!(outcome, Outcome::OutputFailed);
         assert!(out.state().typed.is_empty(), "nothing may be typed");
+    }
+
+    #[test]
+    fn a_space_follows_a_finished_sentence() {
+        use crate::testing::{FakeOutput, FakeRecognizer};
+        let settings = Settings {
+            options: lf_dictation::Options::default(),
+            macros: Vec::new(),
+            type_chunk_chars: TYPE_CHUNK_CHARS,
+            prompt_tag: "[dictated]".into(),
+        };
+        let typed = |kind: JobKind, heard: &str| {
+            let out = FakeOutput::default();
+            let job = Job {
+                id: 1,
+                cancel: Arc::new(CancelToken::default()),
+                kind,
+            };
+            let mut rec = FakeRecognizer::returning(heard);
+            let outcome = run(job, &mut rec, &mut out.clone(), &settings, &|_| {});
+            (out.text(), outcome)
+        };
+        let transcribe = || JobKind::Transcribe {
+            audio: Audio::new(vec![0.1; 16]),
+            prompt: false,
+        };
+        // So the next dictation does not jam against the prior sentence.
+        for end in [".", "!", "?"] {
+            let (text, _) = typed(transcribe(), &format!("Synthetic words{end}"));
+            assert_eq!(text, format!("Synthetic words{end} "));
+        }
+        // The space is typed, not recorded as part of the dictation.
+        let (_, outcome) = typed(transcribe(), "Synthetic words.");
+        assert_eq!(
+            outcome,
+            Outcome::Typed {
+                raw: "Synthetic words.".into(),
+                text: "Synthetic words.".into(),
+                pressed_enter: false,
+                retype: false,
+            }
+        );
+        // Mid-sentence text, other punctuation and Return get no space.
+        assert_eq!(typed(transcribe(), "Synthetic words").0, "Synthetic words");
+        assert_eq!(
+            typed(transcribe(), "Synthetic words,").0,
+            "Synthetic words,"
+        );
+        assert_eq!(
+            typed(transcribe(), "Synthetic words. Press enter.").0,
+            "Synthetic words.\n"
+        );
+        // Paste Again types the space too.
+        let (text, _) = typed(JobKind::Retype("Synthetic again?".into()), "unused");
+        assert_eq!(text, "Synthetic again? ");
     }
 
     #[test]
